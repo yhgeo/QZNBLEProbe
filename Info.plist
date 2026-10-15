@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>zh_CN</string>
 	<key>CFBundleDisplayName</key>
-	<string>热水探测</string>
+	<string>校园热水</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -25,9 +25,9 @@
 	<key>MinimumOSVersion</key>
 	<string>14.0</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>需要蓝牙权限以扫描并连接热水设备，读取其运行参数。</string>
+	<string>需要蓝牙权限以连接校园热水设备，读取状态并开关阀门。</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
-	<string>需要蓝牙权限以扫描并连接热水设备，读取其运行参数。</string>
+	<string>需要蓝牙权限以连接校园热水设备，读取状态并开关阀门。</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UIRequiredDeviceCapabilities</key>

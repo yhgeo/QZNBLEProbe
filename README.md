@@ -1,139 +1,77 @@
-# 热水探测（QZNBLEProbe）
+# 校园热水（QZNBLEProbe）
 
-一个 iOS 只读探针，用来和「趣智校园」体系的校园热水/水控设备做蓝牙通信，
-**把设备的原始报文全部捞回来**，为后续逆向交易报文布局提供素材。
+一个 iOS 客户端，用来连接「趣智校园」体系的校园蓝牙热水设备：
+**登录 → 连设备 → 开阀 → 用水 → 关阀结算**，全流程走官方接口，用你自己的账号、付你自己的钱。
 
-## 为什么需要它
+同时保留了早期做的**只读探针**，用来把设备原始报文捞出来做协议分析。
 
-`SDKQZNetworkOffline`（趣智校园蓝牙交互 SDK 网络版）只提供编译好的静态库，
-其中 `KRTransactionObject` / `KRRateObject` 这两个关键的报文构造类**没有任何公开头文件**，
-无法知道「开始交易」要往 `krTransactionRateForDetails:` 里塞什么字节。
+> 协议分析笔记保存在本地，未随本仓库发布。
 
-所以第一步不是「开水」，而是**读**——把设备状态、消费记录读出来，
-从中拿到项目编号、费率、随机数等真实数据，再反推报文格式。
+---
 
-## 设计原则
+## 两个入口
 
-**只发送读类指令，不会改变设备任何状态。** 具体只做四件事：
+启动后是**登录页**，左上角有「探针」按钮进入调试工具。
 
-| 步骤 | 调用 | 作用 |
+| 功能 | 位置 | 用途 |
 |---|---|---|
-| 1 | `krGetStateOfDevice` | 读设备状态（项目编号、计费方式、交易随机数、密钥编号…） |
-| 2 | `krGetConsumptionDetails` | 读消费记录（**费率**、预扣金额、用水量、水温…） |
-| 3 | `krColdWaterMeterGetStateOfDevice` | 读冷水表信息 |
-| 4 | `krReadingDeviceDataType`（读模式） | 读设备类型 |
+| **客户端** | 登录页 → 主流程 | 正常开阀 / 结算 |
+| **探针** | 登录页左上角 | 只读探测 + 自定义指令，用于诊断 |
 
-界面里还有两个按钮：
+---
 
-- **「指令」**：手动发送任意功能码（用于试探未知指令，**属于写操作，慎用**）
-- **「清消费」**：把采集到的消费原始数据回传给设备，清除「待采集」状态
-  （设备必须先回到空闲才能开始新交易；**属于写操作**）
+## 客户端怎么用
 
-每次探测或写操作结束后，会自动打印 **SDK 内部日志**（`AllLogString`），
-其中包含 SDK 实际收发的原始帧，这是逆向功能码表最直接的素材。
+1. 登录：手机号 + 密码，或手机号 + 短信验证码（**没注册过的手机号会自动注册**）
+2. 点「扫描」→ 再点一次「扫描」结束 → 从列表里选你的热水设备
+3. 点「开始用水」→ 设备开阀，页面开始计时
+4. 用完后点「停止用水」→ 自动关阀并结算，显示本次消费金额
 
-## 真机验证记录（2026-10-15）
+密码不会明文上传：本地先按官方算法处理（MD5 取后 10 位大写）再发送。
+短信验证码的 `secret` 也是本地按手机号算出来的，不需要抓包。
 
-设备：`KLCXKJ-Water`，MAC `c47f0edbd142`
+---
 
-协议帧格式已用真机数据 100% 验证：
+## 流程（以及为什么这么写）
 
 ```
-60 | 长度(2字节大端) | control | funCode | 00 | payload | 校验和 | 16
+开阀：连接 → 读状态(0x23) → 查台账(HTTP) → 下费率(HTTP) → 写费率包(BLE 0x21) → 计时
+结算：关阀(0x22) → 断开重连 → 读状态 → 采集(0x85) → 上传(HTTP) → AES 解密 → 写回(0x86)
 ```
 
-- 长度字段 = payload 长度 + 3
-- 校验和 = `(control + funCode + 0x00 + Σpayload) & 0xFF`（两帧全部吻合）
-- 实测功能码：`0x85` = 读消费详情，`0x18` = 读设备类型
-- 设备响应帧的 control 固定为 `0x81`，发送帧为 `0x80`
+**三个必须守住的点：**
 
-### 功能码表（反汇编全量提取，关键项经真机验证）
+1. **费率包必须来自服务端**——自己造一个写进设备，后果不是"失败"而是"扣错钱"
+2. **`randomNumber` 必须用设备给的**——它在状态帧里，本地生成的对不上
+3. **失败必须上报**——蓝牙通道没有服务端兜底，不报的话这一单会一直挂在预扣状态
 
-| funCode | 操作 | SDK 方法 |
-|---|---|---|
-| `0x17` | 设置密钥（1.1 协议） | `krV1_1SetKeyData:` |
-| `0x18` | 读设备类型 | `krReadingDeviceDataType:MAXType:MINType:` |
-| `0x19` | 清除设备项目信息 | `krClearNumOfDevice:` |
-| `0x20` | 下发项目编号 | `krAssignNumForDevice:productId:` |
-| `0x22` | 结束用水 | `KrStopUsingWater:` |
-| `0x23` | 读设备状态 | `krGetStateOfDevice:` |
-| **`0x31`** | **开始交易（放水）** | `krTransactionRateForDetails:` |
-| **`0x32`** | **结束交易** | `krEndTransactionMAXType:MINType:` |
-| `0x85` | 读消费详情 | `krGetConsumptionDetails:` |
-| `0x86` | 清除消费数据 | `krClearConsumptionDetails:` |
-| `0x88` | 禁用密钥 | `krDisableKeyNo:type:` |
-| `0xC0` | 读冷水表状态 | `krColdWaterMeterGetStateOfDevice:` |
+**两个容易踩的坑（已在代码里处理）：**
 
-`krAssginRateForDevice:commMode:`（下发费率）与 `krPublicSendData:funCode:`
-的功能码由参数动态传入，不是固定值。
+- 关阀后**必须断开重连**再采集。同一连接里「关阀 → 立刻采集」的数据会被服务端判
+  226「加密校验失败」，账单停在 0.0
+- `xfData` **必须小写**。签名用小写、上传字段也必须小写，不一致会报 170「签名错误」
 
-发送帧 `control = 0x80`，设备响应帧 `control = 0x81`（bit0 为响应标志）。
-
-### 已确认的重要行为
-
-- **清除消费数据不需要 tac**：`krClearConsumptionDetails:` 的 payload 就是
-  采集到的 `xfData` 原样回传，设备回 `81 01` 表示成功。
-  清除后设备从「待采集」回到可读状态（读状态不再超时）。
-- **`krTransactionRateForDetails:` 只是转发外部 data**：SDK 内部不做任何构造，
-  payload 格式完全由调用方决定。头文件注释引用的 `KRTransactionObject` /
-  `KRRateObject` 在二进制里**根本不存在**（已用符号表确认）。
-- **SDK 的 payload 是手工按字节拼的**：例如 `krAssignNumForDevice:productId:`
-  内部固定构造 8 字节 payload。
-
-### 设备状态 payload（48 字节，部分字段）
-
-| 偏移 | 长度 | 字段 |
-|---|---|---|
-| 0 | 1 | 固定标志 `0x80` |
-| 1 | 4 | productId |
-| 5 | 4 | deviceId |
-| 9 | 4 | accountId |
-| 13 | 6 | macAddress |
-| 19 | 1 | 单字节字段（onCharge / status 之一） |
-| 20 | 1 | 单字节字段 |
-| 21 | 2 | 双字节字段（疑似 maxType/minType） |
-| 23 | 1 | 单字节字段 |
-| 24 | 4 | 四字节字段 |
-| 28–31 | 4 | 单字节字段组 |
-| 41 | 7 | reserved（全零） |
-
-单字节字段与 `KRStateObject` 属性的精确对应关系尚未完全确定。
-
-消费详情 payload（62 字节）字段布局：
-
-| 偏移 | 长度 | 字段 |
-|---|---|---|
-| 0 | 1 | 固定标志 `0x80` |
-| 1 | 6 | timeId（BCD 时间，如 `261015180739`） |
-| 7 | 4 | productId 项目编号 |
-| 11 | 4 | deviceId |
-| 15 | 4 | accountId |
-| 19 | 1 | accountType |
-| 20 | 4 | useCount |
-| 24 | 4 | ykMoney 预扣金额（厘） |
-| 28 | 4 | consumeMone 消费金额（厘） |
-| 32 | 4 | rate 费率 |
-| 36 | 6 | macAddress |
-| 42 | 20 | 后半段字段（受 SDK 长度判断限制，见下） |
-
-**已知问题**：SDK 解析后半段字段要求 `长度 >= 63`（`cmp x0, #0x3f`），
-而实测设备只返回 62 字节，导致 `useTime` / `flowRate` / `waterTemp` / `tac` 等
-全部解析为 `null`。这是设备固件与 SDK 预期的差异，需要自行按偏移解析。
+---
 
 ## 目录结构
 
 ```
-.
-├── Sources/
-│   ├── main.m                      入口
-│   ├── AppDelegate.h/.m            应用委托
-│   └── ProbeViewController.h/.m    探针主界面（核心逻辑）
-├── Frameworks/
-│   └── QZNOSDK.framework           来自 SDKQZNetworkOffline 1.2.1（MIT，作者 李志权）
-├── Info.plist
-├── project.yml                     xcodegen 工程描述
-└── .github/workflows/build-ipa.yml GitHub Actions 构建流水线
+Sources/
+├── main.m                    入口
+├── AppDelegate.h/.m          按登录态选择根控制器
+├── KRWMCrypto.h/.m           MD5 / 嵌套 MD5 签名 / AES-128-ECB 解密 / hex 工具
+├── KRWMClient.h/.m           服务端接口 + 会话管理 + MAC 换算
+├── LoginViewController.h/.m  登录页（密码 / 验证码，左上角可进探针）
+├── MainViewController.h/.m   主流程：扫描 / 连接 / 开阀 / 结算
+└── ProbeViewController.h/.m  只读探针（调试用）
+Frameworks/
+└── QZNOSDK.framework         来自 SDKQZNetworkOffline 1.2.1（MIT，作者 李志权）
+Info.plist
+project.yml                   xcodegen 工程描述
+.github/workflows/build-ipa.yml
 ```
+
+---
 
 ## 构建
 
@@ -151,21 +89,25 @@
 2. 用 TrollStore 打开它 → Install
 3. 首次启动时允许蓝牙权限
 
-## 使用
-
-1. 点「扫描」→ 等设备列表刷出来 → 再点一次「停止」
-2. 在弹出的列表里选择你的热水设备（名字形如 `HX4-055` 之类）
-3. 连接成功后点「探测」，等四步跑完
-4. 点「复制」，把日志发出来
-
-日志里会包含每一步的 **原始 HEX 报文**、SDK 解析出的字段值，以及 SDK 内部日志。
+---
 
 ## 已知限制
 
 - 只支持真机（arm64），不支持模拟器
+- 支持**账密登录**与**短信验证码登录**；没做微信登录（需要接入微信 SDK）
 - 蓝牙扫描需要设备未被其他手机占用
-- `RSSI` 在 iOS 上通常拿不到（系统限制），显示为 0 属正常
-- 第 4 步「读设备类型」虽然标为读模式，仍属设置类指令，若设备异常可跳过
+- iOS 拿不到 BLE 链路地址，台账查询用的是设备状态帧里自报的 MAC
+- 探针的「指令」「清消费」属于**写操作**，会改变设备状态，仅在需要诊断时使用
+
+## 这个项目不做什么
+
+不绕过计费。费率包由服务端用设备共享密钥加密，密钥在设备芯片里；且设备每次开阀
+成功后立即更新随机数，重放窗口为零；即便骗开阀门，不上传消费数据就拿不到写回数据，
+设备会卡在 `state=3` 无法再次使用。
+
+本项目的用途是：**用正规流程把设备用起来，并拿到精确的用量与账单数据。**
+
+---
 
 ## 许可
 
