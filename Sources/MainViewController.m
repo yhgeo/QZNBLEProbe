@@ -124,6 +124,8 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
 @property (nonatomic, strong) NSData *xfPayload;        // 采集到的消费原始数据
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, assign) NSTimeInterval startedAt;
+/// 本轮开阀已尝试补结算的次数，防止「补结算 → 仍非空闲 → 再补结算」死循环
+@property (nonatomic, assign) NSInteger settleAttempts;
 
 /// 关阀后重连成功时要接着跑的动作
 @property (nonatomic, copy) void (^pendingReconnectBlock)(void);
@@ -375,10 +377,16 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
 #pragma mark - 开阀
 
 - (void)startWater {
-    self.busy = YES;
-    [self refreshActionButton];
+    self.settleAttempts = 0;      // 用户手动发起，重置补结算计数
     [self log:@""];
     [self log:@"========== 开始用水 =========="];
+    [self beginOpenFlow];
+}
+
+/// 开阀流程主体。与 startWater 分开，是为了让「补结算后自动续跑」复用它而不重置计数
+- (void)beginOpenFlow {
+    self.busy = YES;
+    [self refreshActionButton];
 
     __weak typeof(self) ws = self;
     [[KRWMCore sharedCore] krGetStateOfDevice:^(KRSyncType t, NSData *d, NSString *orig) {
@@ -402,6 +410,11 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
     if (st.state != 0) {
         if (st.state == 3 || st.state == 6) {
             // 有遗留未结算记录：先补结算，清掉后设备才能开阀
+            self.settleAttempts += 1;
+            if (self.settleAttempts > 1) {
+                [self fail:@"设备仍有未结算的遗留记录，请稍后重试"];
+                return;
+            }
             [self log:@"设备有未结算的遗留记录，先自动结清…"];
             [self settlePendingWithState:st];
             return;
@@ -558,12 +571,25 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
 }
 
 - (void)collectConsumption {
+    [self collectConsumptionAttempt:1];
+}
+
+/// 设备刚关阀时消费数据可能还没落盘，首次采集为空属正常——稍等重试一次
+- (void)collectConsumptionAttempt:(NSInteger)attempt {
     __weak typeof(self) ws = self;
     [[KRWMCore sharedCore] krGetConsumptionDetails:^(KRSyncType t, NSData *d, NSString *orig) {
         dispatch_async(dispatch_get_main_queue(), ^{ ws.xfPayload = d; });
     } result:^(KRSyncType t, KRSyncResponseState s) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (ws.xfPayload.length == 0) {
+                if (attempt < 2) {
+                    [ws log:@"首次未读到消费数据，稍后重试…"];
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        [ws collectConsumptionAttempt:attempt + 1];
+                    });
+                    return;
+                }
                 [ws log:@"⚠️ 未采集到消费数据"];
                 [ws reportFailAndFinish:@"未采集到消费数据"];
                 return;
@@ -641,11 +667,11 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
 
                 void (^after)(void) = ^{
                     [ws log:@"✅ 遗留账单已结清"];
-                    // 补结算后需要一次全新连接，设备才会给出可用的会话参数
+                    // 补结算后需要一次全新连接，设备才会给出可用的会话参数；
+                    // 重连成功后自动接着开阀，用户不必再点一次
                     [ws reconnectThenRun:^{
-                        [ws log:@"请重新点击「开始用水」"];
-                        ws.busy = NO;
-                        [ws refreshActionButton];
+                        [ws log:@"已重新连接，自动继续开阀…"];
+                        [ws beginOpenFlow];
                     }];
                 };
 
@@ -718,8 +744,11 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
     [self refreshActionButton];
     [self updateInfoLabel];
 
-    // 结算完断开，下次从头连
-    [[KRWMCore sharedCore] disconnect];
+    // 保持连接：结算流程里已经断开重连过一次，连接是活的。
+    // 用户可以直接再点「开始用水」，不必重新扫描。
+    if (self.connected) {
+        [self log:@"（连接保持中，可直接再次点「开始用水」）"];
+    }
 }
 
 #pragma mark - 退出登录
