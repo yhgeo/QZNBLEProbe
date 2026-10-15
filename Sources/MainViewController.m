@@ -144,6 +144,8 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
 @property (nonatomic, assign) NSInteger autoSampleTotal;   // 总轮数
 @property (nonatomic, assign) NSInteger autoSampleDone;    // 已完成轮数
 @property (nonatomic, assign) NSUInteger autoSampleGeneration; // 递增以作废已排程的自动关水
+/// 自动采样期间连续连接失败的次数（连接成功即清零，超限才中止采样）
+@property (nonatomic, assign) NSInteger autoReconnectTries;
 
 /// 关阀后重连成功时要接着跑的动作
 @property (nonatomic, copy) void (^pendingReconnectBlock)(void);
@@ -289,6 +291,7 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
             ws.connected = p;
             ws.lastPeripheral = p;
             ws.reconnectingLast = NO;
+            ws.autoReconnectTries = 0;   // 连上了就清零失败计数
             [ws rememberDevice:p];
             [ws updateDeviceLabel];
             // 连接成功后必须刷新主按钮，否则「开始用水」会一直停在禁用状态
@@ -306,6 +309,25 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
     core.connectionFailHandler = ^(CBPeripheral *p) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [ws log:[NSString stringWithFormat:@"❌ 连接失败：%@", p.name ?: @"(无名)"]];
+            // 自动采样模式不轻易放弃：2 秒后自动重连，连续失败 3 次才中止
+            if (ws.autoSampleActive && ws.lastPeripheral != nil) {
+                ws.autoReconnectTries += 1;
+                if (ws.autoReconnectTries > 3) {
+                    [ws log:@"🧪 连续连接失败，自动采样中止"];
+                    ws.autoSampleActive = NO;
+                    ws.busy = NO;
+                    [ws refreshActionButton];
+                    return;
+                }
+                [ws log:[NSString stringWithFormat:@"🧪 自动重连（第 %ld 次）…",
+                         (long)ws.autoReconnectTries]];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (!ws.autoSampleActive || ws.connected != nil) return;
+                    [[KRWMCore sharedCore] connectPeripheral:ws.lastPeripheral];
+                });
+                return;   // 保持 busy，等连接结果
+            }
             ws.busy = NO;
             [ws refreshActionButton];
         });
@@ -484,13 +506,23 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
     BOOL canAct = (self.connected != nil) && !self.busy;
     self.actionButton.enabled = canAct;
 
+    NSString *title;
+    UIColor *color;
+    if (self.startedAt > 0) {
+        title = self.autoSampleActive ? @"结束本轮（采样继续）" : @"停止用水";
+        color = [UIColor systemRedColor];
+    } else if (self.autoSampleActive) {
+        title = @"采样中…";
+        color = [UIColor systemGrayColor];
+    } else {
+        title = @"开始用水";
+        color = [UIColor systemBlueColor];
+    }
+
     // 禁用态必须显式置灰：UIButton 的 backgroundColor 不会随 enabled 自动变
-    self.actionButton.backgroundColor = canAct
-        ? (self.startedAt > 0 ? [UIColor systemRedColor] : [UIColor systemBlueColor])
-        : [UIColor systemGrayColor];
+    self.actionButton.backgroundColor = canAct ? color : [UIColor systemGrayColor];
     [self.actionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [self.actionButton setTitle:(self.startedAt > 0 ? @"停止用水" : @"开始用水")
-                       forState:UIControlStateNormal];
+    [self.actionButton setTitle:title forState:UIControlStateNormal];
 
     self.scanButton.enabled = !self.busy;
     [self refreshLastDeviceButton];
@@ -525,7 +557,8 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
     [self readStateAttempt:1];
 }
 
-/// 读设备状态。刚重连上来时设备常常还没准备好，首次无响应属常见——自动退避重试
+/// 读设备状态。刚重连上来时设备常常还没准备好，首次无响应属常见——自动退避重试；
+/// 若重试期间连接掉了，先重连再试，而不是对着空气盲读
 - (void)readStateAttempt:(NSInteger)attempt {
     self.deviceState = nil;
     __weak typeof(self) ws = self;
@@ -534,8 +567,13 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
     } result:^(KRSyncType t, KRSyncResponseState s) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (s != KRSyncResponseStateSuccess || ws.deviceState == nil) {
-                if (attempt < 3) {
+                if (attempt < 4) {
                     [ws log:[NSString stringWithFormat:@"第 %ld 次读取状态无响应，稍后重试…", (long)attempt]];
+                    if (ws.connected == nil) {
+                        [ws log:@"连接已断开，重连后继续…"];
+                        [ws reconnectThenRun:^{ [ws readStateAttempt:attempt + 1]; }];
+                        return;
+                    }
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                                  (int64_t)(0.8 * attempt * NSEC_PER_SEC)),
                                    dispatch_get_main_queue(), ^{
@@ -725,16 +763,27 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
     [self collectConsumptionAttempt:1];
 }
 
-/// 设备刚关阀时消费数据可能还没落盘，首次采集为空属正常——稍等重试一次
+/// 设备刚关阀时消费数据可能还没落盘，首次采集为空属正常——稍等重试一次。
+/// ⚠️ 每次采集前必须清空 xfPayload：它只在结算收尾时清，
+/// 补结算等路径会留下旧记录——不清的话采集一旦无响应，旧数据会被当新数据上传，
+/// 实测导致同一笔记录重复记账（2026-10-16 蓝牙(5).txt 第 22/43 行逐字节相同）。
 - (void)collectConsumptionAttempt:(NSInteger)attempt {
+    self.xfPayload = nil;
     __weak typeof(self) ws = self;
     [[KRWMCore sharedCore] krGetConsumptionDetails:^(KRSyncType t, NSData *d, NSString *orig) {
-        dispatch_async(dispatch_get_main_queue(), ^{ ws.xfPayload = d; });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (d.length > 0) { ws.xfPayload = d; }
+        });
     } result:^(KRSyncType t, KRSyncResponseState s) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (ws.xfPayload.length == 0) {
-                if (attempt < 2) {
-                    [ws log:@"首次未读到消费数据，稍后重试…"];
+                if (attempt < 4) {
+                    [ws log:[NSString stringWithFormat:@"第 %ld 次未读到消费数据，稍后重试…", (long)attempt]];
+                    if (ws.connected == nil) {
+                        [ws log:@"连接已断开，重连后继续…"];
+                        [ws reconnectThenRun:^{ [ws collectConsumptionAttempt:attempt + 1]; }];
+                        return;
+                    }
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                                    dispatch_get_main_queue(), ^{
                         [ws collectConsumptionAttempt:attempt + 1];
@@ -769,8 +818,12 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
             return;
         }
 
-        NSString *money = KRWMStringValue(data[@"consumeMoney"]);
-        [ws log:[NSString stringWithFormat:@"✅ 服务端已记账，本次消费 %@ 元", money ?: @"?"]];
+        NSString *money = KRWMStringValue(data[@"consumeMoney"]) ?: @"?";
+        // 服务端此字段单位是厘（26 = 0.026 元）；带小数点的按已是元处理
+        NSString *shown = [money containsString:@"."]
+            ? money
+            : [NSString stringWithFormat:@"%.3f", money.doubleValue / 1000.0];
+        [ws log:[NSString stringWithFormat:@"✅ 服务端已记账，本次消费 %@ 元", shown]];
 
         NSData *backBytes = KRWMWriteBackBytes(KRWMStringValue(data[@"clData"]));
         if (backBytes.length == 0) {
@@ -803,9 +856,12 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
 
 /// 遗留数据补结算（设备 state=3/6）
 - (void)settlePendingWithState:(KRWMDeviceState *)st {
+    self.xfPayload = nil;   // 防残留（见 collectConsumptionAttempt 注释）
     __weak typeof(self) ws = self;
     [[KRWMCore sharedCore] krGetConsumptionDetails:^(KRSyncType t, NSData *d, NSString *orig) {
-        dispatch_async(dispatch_get_main_queue(), ^{ ws.xfPayload = d; });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (d.length > 0) { ws.xfPayload = d; }
+        });
     } result:^(KRSyncType t, KRSyncResponseState s) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (ws.xfPayload.length == 0) {
@@ -834,10 +890,22 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
                 };
 
                 NSData *backBytes = KRWMWriteBackBytes(KRWMStringValue(data[@"clData"]));
-                if (backBytes.length == 0) { after(); return; }
+                if (backBytes.length == 0) {
+                    [ws log:@"⚠️ 服务端未返回写回数据，遗留记录可能未清"];
+                    after();
+                    return;
+                }
                 [[KRWMCore sharedCore] krClearConsumptionDetails:backBytes
                     dataCallback:^(KRSyncType t, NSData *d, NSString *orig) {}
-                    result:^(KRSyncType t, KRSyncResponseState s) { after(); }];
+                    result:^(KRSyncType t, KRSyncResponseState s) {
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            // 写回结果要如实记录：8101 只代表命令被确认，不代表记录已清
+                            [ws log:(s == KRSyncResponseStateSuccess
+                                     ? @"✅ 遗留账单已结清"
+                                     : @"⚠️ 遗留记录写回未确认（若未清，下轮会再次补结算）")];
+                            after();
+                        });
+                    }];
             }];
         });
     }];
@@ -868,15 +936,21 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
 }
 
 - (void)updateInfoLabel {
+    NSString *progress = @"";
+    if (self.autoSampleActive) {
+        progress = [NSString stringWithFormat:@"🧪 采样 %ld/%ld 轮\n",
+                    (long)self.autoSampleDone, (long)self.autoSampleTotal];
+    }
     if (self.startedAt <= 0) {
-        self.infoLabel.text = self.rateText.length ? self.rateText : @"—";
+        self.infoLabel.text = [progress stringByAppendingString:
+                               (self.rateText.length ? self.rateText : @"—")];
         return;
     }
     NSTimeInterval elapsed = [NSDate date].timeIntervalSince1970 - self.startedAt;
     int minutes = (int)(elapsed / 60);
     int seconds = (int)elapsed % 60;
-    self.infoLabel.text = [NSString stringWithFormat:@"用水 %02d:%02d\n%@",
-                           minutes, seconds, self.rateText ?: @""];
+    self.infoLabel.text = [NSString stringWithFormat:@"%@用水 %02d:%02d\n%@",
+                           progress, minutes, seconds, self.rateText ?: @""];
 }
 
 #pragma mark - 收尾
@@ -1026,6 +1100,11 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
         [ac addAction:[UIAlertAction actionWithTitle:@"自动采样（tac 样本）" style:UIAlertActionStyleDefault
                                               handler:^(UIAlertAction *a) { [ws onAutoSample]; }]];
     }
+    [ac addAction:[UIAlertAction actionWithTitle:@"复制全部日志" style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *a) {
+            [UIPasteboard generalPasteboard].string = ws.log;
+            [ws log:@"📋 日志已复制到剪贴板"];
+        }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"探针（调试）" style:UIAlertActionStyleDefault
                                           handler:^(UIAlertAction *a) { [ws onProbe]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"退出登录" style:UIAlertActionStyleDestructive
@@ -1073,6 +1152,33 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
     self.logView.text = self.log;
     NSRange bottom = NSMakeRange(self.logView.text.length, 0);
     [self.logView scrollRangeToVisible:bottom];
+    [self appendLogToFile:text];
+}
+
+/// 每行日志同步追加到 Documents/runtime_log.txt（带时间戳）。
+/// 文件在「文件」App 里可直接取走（Info.plist 已开 UIFileSharingEnabled）。
+- (void)appendLogToFile:(NSString *)text {
+    static NSString *path = nil;
+    static NSDateFormatter *fmt = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        path = [dir stringByAppendingPathComponent:@"runtime_log.txt"];
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"MM-dd HH:mm:ss";
+    });
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
+                      [fmt stringFromDate:[NSDate date]], text];
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    if (data.length == 0) return;
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (fh == nil) {
+        [data writeToFile:path atomically:YES];   // 首次创建
+        return;
+    }
+    [fh seekToEndOfFile];
+    [fh writeData:data];
+    [fh closeFile];
 }
 
 @end
