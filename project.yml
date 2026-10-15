@@ -1,0 +1,48 @@
+name: QZNBLEProbe
+
+options:
+  bundleIdPrefix: com.qznprobe
+  deploymentTarget:
+    iOS: "14.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+targets:
+  QZNBLEProbe:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+        excludes:
+          - "*.plist"
+    settings:
+      base:
+        PRODUCT_NAME: QZNBLEProbe
+        PRODUCT_BUNDLE_IDENTIFIER: com.qznprobe.hotwater
+        INFOPLIST_FILE: Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: "1.0"
+        IPHONEOS_DEPLOYMENT_TARGET: "14.0"
+        ARCHS: arm64
+        ONLY_ACTIVE_ARCH: NO
+        ENABLE_BITCODE: NO
+        CLANG_ENABLE_OBJC_ARC: YES
+        SWIFT_VERSION: "5.0"
+
+        # QZNOSDK 是 MRC 静态库，且使用了 CBPeripheral 的 category，
+        # 必须加 -ObjC 才能把 category 链接进来
+        OTHER_LDFLAGS:
+          - -ObjC
+          - -framework
+          - QZNOSDK
+        FRAMEWORK_SEARCH_PATHS:
+          - $(SRCROOT)/Frameworks
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/Frameworks/QZNOSDK.framework/Headers
+
+        # 未签名构建：产物交给 TrollStore 自行伪签名
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGN_ENTITLEMENTS: ""

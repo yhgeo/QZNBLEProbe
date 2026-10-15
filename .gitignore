@@ -1,0 +1,22 @@
+# xcodegen 生成的工程，不入库
+*.xcodeproj/
+*.xcworkspace/
+
+# 构建产物
+build/
+DerivedData/
+Payload/
+*.ipa
+*.dSYM/
+
+# macOS / Xcode
+.DS_Store
+xcuserdata/
+*.xcuserstate
+
+# 编辑器
+.idea/
+.vscode/
+
+# 本机工作记录，不入库
+.workbuddy-ai/

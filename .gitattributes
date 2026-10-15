@@ -1,0 +1,7 @@
+# 源码统一用 LF（Xcode / clang 的标准换行）
+* text=auto eol=lf
+
+# 二进制文件不要做任何转换
+*.framework/QZNOSDK binary
+*.ipa binary
+*.jar binary
