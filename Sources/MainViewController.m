@@ -738,9 +738,49 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
 /// 关阀后必须**断开重连**再采集：同一连接里「关阀后立刻采集」的数据会被服务端判
 /// 226「加密校验失败」（linyu 2026-09-30 实测），重连后采集才能被接受。
 - (void)settleAfterClose {
-    [self log:@"关阀后重新连接，再读取消费数据…"];
+    [self log:@"关阀后重新连接，读取消费数据…"];
     __weak typeof(self) ws = self;
-    [self reconnectThenRun:^{ [ws collectConsumption]; }];
+    [self reconnectThenRun:^{
+        // 重连后先刷新一次状态：设备在开阀成功时会更新 randomNumber，
+        // 拿开阀前的旧随机数上传会被服务端判 226（2026-10-16 实测）
+        [ws readStateThenRun:1 block:^{ [ws collectConsumption]; }];
+    }];
+}
+
+/// 读一次设备状态后回调（带重连与退避重试）。只刷新 deviceState，不走开阀分派。
+/// 读不到时也继续（老流程不刷新也能成功），不让结算卡死在这里。
+- (void)readStateThenRun:(NSInteger)attempt block:(void (^)(void))block {
+    __weak typeof(self) ws = self;
+    [[KRWMCore sharedCore] krGetStateOfDevice:^(KRSyncType t, NSData *d, NSString *orig) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            KRWMDeviceState *st = KRWMParseStatePayload(d);
+            if (st) {
+                ws.deviceState = st;
+                [ws log:[NSString stringWithFormat:@"设备状态：state=%u random=%@（结算前已刷新）",
+                         st.state, st.randomNumber]];
+            }
+        });
+    } result:^(KRSyncType t, KRSyncResponseState s) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (s != KRSyncResponseStateSuccess) {
+                if (attempt < 3) {
+                    [ws log:[NSString stringWithFormat:@"第 %ld 次刷新状态无响应，稍后重试…", (long)attempt]];
+                    if (ws.connected == nil) {
+                        [ws reconnectThenRun:^{ [ws readStateThenRun:attempt + 1 block:block]; }];
+                        return;
+                    }
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                 (int64_t)(0.8 * attempt * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        [ws readStateThenRun:attempt + 1 block:block];
+                    });
+                    return;
+                }
+                [ws log:@"⚠️ 刷新状态失败，按原会话参数继续"];
+            }
+            block();
+        });
+    }];
 }
 
 - (void)reconnectThenRun:(void (^)(void))block {
@@ -800,6 +840,12 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
 }
 
 - (void)upload {
+    [self uploadAttempt:1];
+}
+
+/// 上传消费数据。失败时先刷新 randomNumber 再重试一次（226 多为会话参数过期），
+/// 仍失败才走失败上报——订单必须收口，否则预扣一直挂着
+- (void)uploadAttempt:(NSInteger)attempt {
     // xfData 必须小写（KRWMClient 内部还会再兜一次）
     NSString *xfData = [[KRWMCrypto hexFromData:self.xfPayload] lowercaseString];
     KRWMDeviceState *st = self.deviceState;
@@ -813,6 +859,11 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
                          randomNumber:st.randomNumber ?: @""
                            completion:^(BOOL ok, NSDictionary *data, NSString *message) {
         if (!ok || data == nil) {
+            if (attempt < 2) {
+                [ws log:[NSString stringWithFormat:@"⚠️ 上传失败（%@），刷新状态后重试一次…", message]];
+                [ws readStateThenRun:1 block:^{ [ws uploadAttempt:attempt + 1]; }];
+                return;
+            }
             [ws log:[NSString stringWithFormat:@"⚠️ 上传失败：%@", message]];
             [ws reportFailAndFinish:message];
             return;
@@ -1102,8 +1153,13 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
     }
     [ac addAction:[UIAlertAction actionWithTitle:@"复制全部日志" style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *a) {
-            [UIPasteboard generalPasteboard].string = ws.log;
-            [ws log:@"📋 日志已复制到剪贴板"];
+            // 优先取落盘文件（带时间戳）；文件不存在再用屏幕日志
+            NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+            NSString *path = [dir stringByAppendingPathComponent:@"runtime_log.txt"];
+            NSString *content = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL];
+            if (content.length == 0) content = ws.log;
+            [UIPasteboard generalPasteboard].string = content;
+            [ws log:@"📋 日志已复制到剪贴板（含时间戳）"];
         }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"探针（调试）" style:UIAlertActionStyleDefault
                                           handler:^(UIAlertAction *a) { [ws onProbe]; }]];
