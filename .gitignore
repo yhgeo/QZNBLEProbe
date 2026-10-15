@@ -21,3 +21,6 @@ xcuserdata/
 
 # 本机工作记录，不入库
 .workbuddy-ai/
+
+# 本地分析工具（双用途，公开仓库只放结论不放工具）
+tools/

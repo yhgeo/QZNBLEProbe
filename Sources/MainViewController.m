@@ -746,6 +746,8 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
     NSString *xfData = [[KRWMCrypto hexFromData:self.xfPayload] lowercaseString];
     KRWMDeviceState *st = self.deviceState;
     [self log:[NSString stringWithFormat:@"上传消费数据（%lu 字节）…", (unsigned long)self.xfPayload.length]];
+    // 完整帧入日志：正常用水即积累（记录, tac）样本对，供本地离线分析 tac 结构
+    [self log:[NSString stringWithFormat:@"xfData=%@", xfData]];
 
     __weak typeof(self) ws = self;
     [[KRWMClient shared] uploadXfData:xfData
@@ -798,6 +800,7 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
                 return;
             }
             NSString *xfData = [[KRWMCrypto hexFromData:ws.xfPayload] lowercaseString];
+            [ws log:[NSString stringWithFormat:@"xfData=%@", xfData]];   // 样本积累，见 upload 处注释
             [[KRWMClient shared] uploadXfData:xfData
                                  protocolType:st.protocolType ?: @""
                                  randomNumber:st.randomNumber ?: @""
