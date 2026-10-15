@@ -119,9 +119,9 @@ static NSString *LEDUploadAmountFromResults(NSArray<LEDVerifyResult *> *results)
     return nil;
 }
 
-/// 把 §5.2 的字段表逐项抠出来（大端 + BCD 时间）
+/// 把 §4.2 的字段表逐项抠出来（大端 + BCD 时间）
 ///
-/// ⚠️ 42..61 的**宽度按设备实测**（PROTOCOL.md §16.3）：`flowRate` / `useTime`
+/// ⚠️ 42..61 的**宽度按设备实测**（PROTOCOL.md §5.3）：`flowRate` / `useTime`
 /// 是 2 字节，**不能**照抄 iOS SDK 反汇编里的 4 字节偏移——SDK 那套是
 /// `pluseNum` 当 8 字节，读真机 62 字节帧时会串位。
 static NSDictionary *LEDParseConsumption(NSData *payload) {
@@ -229,7 +229,7 @@ static NSDictionary *LEDInspectFrame(NSString *orig, unsigned int expectFunCode)
 
 /// 用真机实测样本做一次离线自检：确认字段偏移没写错。
 ///
-/// 样本来自探针真机日志（PROTOCOL.md §16.2），字段值已知，可当回归用例。
+/// 样本来自探针真机日志（PROTOCOL.md §4.2），字段值已知，可当回归用例。
 /// 硬编码的是**公开的协议样本**，不含任何账号凭据。
 static void LEDSelfTestAgainstRealSample(LEDVerifyRunner *runner) {
     static NSString * const kRealPayload =
@@ -260,7 +260,7 @@ static void LEDSelfTestAgainstRealSample(LEDVerifyRunner *runner) {
     expect(@"pauseCnt", @(1));
     expect(@"tac", @"0fdf82");
 
-    // 顺带核对 CRC 公式（§14.2）：crc = (Σpayload + control + funCode) & 0xFF
+    // 顺带核对 CRC 公式（§5.1）：crc = (Σpayload + control + funCode) & 0xFF
     NSUInteger sum = 0;
     const uint8_t *b = payload.bytes;
     for (NSUInteger i = 0; i < payload.length; i++) sum += b[i];
@@ -272,7 +272,7 @@ static void LEDSelfTestAgainstRealSample(LEDVerifyRunner *runner) {
                 title:@"离线回归：用真机实测样本验证字段偏移"
               verdict:bad.count == 0 ? V_PASS : V_FAIL
                detail:bad.count == 0
-                      ? @"16 个字段 + CRC + 长度字段全部命中（样本见 PROTOCOL.md §16.2）"
+                      ? @"16 个字段 + CRC + 长度字段全部命中（样本见 PROTOCOL.md §4.2）"
                       : [NSString stringWithFormat:@"%lu 项不符：%@", (unsigned long)bad.count,
                          [bad componentsJoinedByString:@"; "]]
              evidence:[NSString stringWithFormat:@"payload(%luB)=%@", (unsigned long)payload.length,

@@ -3,7 +3,7 @@
 //  热水器蓝牙 —— 加密 / 签名 / 编解码
 //
 //  所有算法均来自对官方 Android 客户端（趣智校园）与开源项目 linyu 的交叉验证，
-//  详见 PROTOCOL.md 第六、八节。
+//  详见 PROTOCOL.md §6（服务端签名）与 §7.1（设备域 AES）。
 //
 
 #import <Foundation/Foundation.h>
