@@ -27,6 +27,8 @@ targets:
         CURRENT_PROJECT_VERSION: 1
         MARKETING_VERSION: "1.0"
         IPHONEOS_DEPLOYMENT_TARGET: "14.0"
+        # 仅 iPhone：工具类 App，避免声明支持 iPad 却只配竖屏导致兼容模式黑边
+        TARGETED_DEVICE_FAMILY: "1"
         ARCHS: arm64
         ONLY_ACTIVE_ARCH: NO
         ENABLE_BITCODE: NO
