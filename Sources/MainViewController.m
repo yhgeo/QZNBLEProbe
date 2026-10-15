@@ -15,6 +15,7 @@
 #import "KRWMClient.h"
 #import "KRWMCrypto.h"
 #import "ProbeViewController.h"
+#import "WalletViewController.h"
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <QZNOSDK/KRWaterMeterKit.h>
 
@@ -163,9 +164,13 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
     self.navigationItem.leftBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"探针" style:UIBarButtonItemStylePlain
                                         target:self action:@selector(onProbe)];
-    self.navigationItem.rightBarButtonItem =
+    // 右侧两个入口：钱包更常用，放在靠右
+    self.navigationItem.rightBarButtonItems = @[
         [[UIBarButtonItem alloc] initWithTitle:@"退出" style:UIBarButtonItemStylePlain
-                                        target:self action:@selector(onLogout)];
+                                        target:self action:@selector(onLogout)],
+        [[UIBarButtonItem alloc] initWithTitle:@"钱包" style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(onWallet)],
+    ];
     self.navigationItem.prompt = [NSString stringWithFormat:@"已登录 %@", masked];
 
     [self restoreLastDevice];
@@ -895,6 +900,12 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
 
 - (void)onProbe {
     [self.navigationController pushViewController:[[ProbeViewController alloc] init] animated:YES];
+}
+
+#pragma mark - 钱包入口
+
+- (void)onWallet {
+    [self.navigationController pushViewController:[[WalletViewController alloc] init] animated:YES];
 }
 
 #pragma mark - 退出登录

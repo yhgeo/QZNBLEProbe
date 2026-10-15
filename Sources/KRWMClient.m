@@ -512,6 +512,51 @@ static NSString *KRWMQueryString(NSDictionary<NSString *, NSString *> *params) {
     [task resume];
 }
 
+#pragma mark - 钱包 / 账单
+
+- (void)loadWalletWithCompletion:(KRWMResponseHandler)completion {
+    [self getPath:@"/account/wallet" query:nil authed:YES completion:completion];
+}
+
+- (void)loadBillsForMonth:(NSString *)month completion:(KRWMListHandler)completion {
+    NSMutableDictionary<NSString *, NSString *> *all = [NSMutableDictionary dictionary];
+    [all addEntriesFromDictionary:[self authFields]];
+    if (month.length > 0) all[@"month"] = month;
+    all[@"billRequestType"] = @"2";
+
+    NSString *full = [kBaseURL stringByAppendingString:@"/order/query/account/bill/list"];
+    NSString *qs = KRWMQueryString(all);
+    if (qs.length > 0) full = [full stringByAppendingFormat:@"?%@", qs];
+
+    NSURL *url = [NSURL URLWithString:full];
+    if (url == nil) { [self finishList:completion ok:NO list:nil message:@"接口地址无效"]; return; }
+
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"GET";
+    req.timeoutInterval = 15.0;
+    [self applyConfigHeaders:req];
+
+    [self sendRaw:req completion:^(BOOL ok, NSDictionary *json, NSString *message) {
+        BOOL success = [json[@"success"] boolValue];
+        id data = json[@"data"];
+        NSArray *list = [data isKindOfClass:[NSArray class]] ? data : nil;
+
+        if (!success || list == nil) {
+            NSString *msg = KRWMString(json[@"errorMessage"]) ?: message;
+            [self finishList:completion ok:NO list:nil
+                     message:(msg.length ? msg : @"账单获取失败")];
+            return;
+        }
+        [self finishList:completion ok:YES list:list message:@""];
+    }];
+}
+
+- (void)finishList:(KRWMListHandler)completion ok:(BOOL)ok list:(NSArray *)list message:(NSString *)message {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (completion) completion(ok, list, message ?: @"");
+    });
+}
+
 #pragma mark - MAC 换算
 
 + (NSString *)normalizeMac:(NSString *)mac {

@@ -16,6 +16,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// @param message 失败原因 / 服务端提示
 typedef void (^KRWMResponseHandler)(BOOL ok, NSDictionary * _Nullable data, NSString *message);
 
+/// 列表型接口的回调（账单列表的 data 是数组，不是字典）
+typedef void (^KRWMListHandler)(BOOL ok, NSArray * _Nullable list, NSString *message);
+
 @interface KRWMClient : NSObject
 
 + (instancetype)shared;
@@ -77,6 +80,19 @@ typedef void (^KRWMResponseHandler)(BOOL ok, NSDictionary * _Nullable data, NSSt
 /// 上报失败订单。蓝牙通道没有服务端兜底，开阀后没能正常结算时必须调用
 - (void)reportFailWithConsumeDate:(NSString *)consumeDate
                        completion:(KRWMResponseHandler)completion;
+
+#pragma mark - 钱包 / 账单
+
+/// 账户余额（`GET /account/wallet`）
+/// 返回 `data`：`accountRealMoney` 实际余额、`accountGivenMoney` 赠送金额
+- (void)loadWalletWithCompletion:(KRWMResponseHandler)completion;
+
+/// 水费账单列表（`GET /order/query/account/bill/list`）
+///
+/// @param month 形如 `2026-10`；传 nil 取服务端默认（本月）
+/// @return 数组元素为 `{"consumeBillDTO": {...}}`
+- (void)loadBillsForMonth:(nullable NSString *)month
+               completion:(KRWMListHandler)completion;
 
 #pragma mark - MAC 换算
 
