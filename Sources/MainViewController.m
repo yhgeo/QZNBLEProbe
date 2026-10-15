@@ -175,6 +175,14 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
     [self log:@"用完后点「停止用水」，会自动结算。"];
 }
 
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    // KRWMCore 是单例，探针页会覆盖它的连接回调；
+    // 回到本页必须重新装回自己的，否则「蓝牙已连上但界面没反应」
+    [self setupSDK];
+    [self refreshActionButton];
+}
+
 - (void)dealloc {
     [self.timer invalidate];
 }
@@ -413,13 +421,42 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
         NSString *title = [NSString stringWithFormat:@"%@  %@", p.name ?: @"(无名)", [p formattedMacAddress] ?: @""];
         [ac addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             [ws log:[NSString stringWithFormat:@"正在连接 %@…", p.name ?: @"(无名)"]];
-            [[KRWMCore sharedCore] connectPeripheral:p];
+            if (![[KRWMCore sharedCore] connectPeripheral:p]) {
+                [ws log:@"⚠️ 连接请求未被接受，请重试"];
+                return;
+            }
+            [ws scheduleConnectTimeout];
         }]];
     }
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     ac.popoverPresentationController.sourceView = self.view;
     ac.popoverPresentationController.sourceRect = self.view.bounds;
     [self presentViewController:ac animated:YES completion:nil];
+}
+
+/// 连接回调迟迟不来时的兜底：若 SDK 自认已连接，就按实际状态恢复界面
+- (void)scheduleConnectTimeout {
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (ws.connected != nil) return;
+
+        KRWMCore *core = [KRWMCore sharedCore];
+        if ([core isConnected] && core.peripheral != nil) {
+            [ws log:@"⚠️ 连接回调未触发，已按实际连接状态恢复"];
+            CBPeripheral *p = core.peripheral;
+            ws.connected = p;
+            ws.lastPeripheral = p;
+            ws.reconnectingLast = NO;
+            [ws rememberDevice:p];
+            [ws updateDeviceLabel];
+            [ws refreshActionButton];
+            return;
+        }
+        [ws log:@"⚠️ 连接超时，请重试"];
+        ws.busy = NO;
+        [ws refreshActionButton];
+    });
 }
 
 - (void)updateDeviceLabel {

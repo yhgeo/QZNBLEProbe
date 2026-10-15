@@ -116,6 +116,13 @@ static NSString *RespStateName(KRSyncResponseState s) {
     [self log:@""];
 }
 
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    // KRWMCore 是单例，主页面会覆盖它的连接回调；
+    // 进入本页要重新装回探针自己的，否则这里也收不到连接事件
+    [self setupSDK];
+}
+
 - (void)setupUI {
     self.statusLabel = [[UILabel alloc] init];
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
