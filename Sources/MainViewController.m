@@ -153,6 +153,8 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
                                         target:self action:@selector(onLogout)];
     self.navigationItem.prompt = [NSString stringWithFormat:@"已登录 %@", masked];
 
+    [self refreshActionButton];
+
     [self log:@"① 点「扫描」→ ② 再点「扫描」结束并选设备 → ③ 点「开始用水」"];
     [self log:@"用完后点「停止用水」，会自动结算。"];
 }
@@ -243,6 +245,8 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
             ws.connected = p;
             ws.lastPeripheral = p;
             [ws updateDeviceLabel];
+            // 连接成功后必须刷新主按钮，否则「开始用水」会一直停在禁用状态
+            [ws refreshActionButton];
             [ws log:[NSString stringWithFormat:@"✅ 已连接 %@  %@",
                      p.name ?: @"(无名)", [p formattedMacAddress] ?: @"?"]];
 
