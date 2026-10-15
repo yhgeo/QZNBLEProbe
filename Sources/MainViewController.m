@@ -161,16 +161,13 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
     NSString *masked = phone.length == 11
         ? [phone stringByReplacingCharactersInRange:NSMakeRange(3, 4) withString:@"****"]
         : phone;
+    // 左上角「设置」收纳探针与退出登录；右上角常驻「钱包」
     self.navigationItem.leftBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"探针" style:UIBarButtonItemStylePlain
-                                        target:self action:@selector(onProbe)];
-    // 右侧两个入口：钱包更常用，放在靠右
-    self.navigationItem.rightBarButtonItems = @[
-        [[UIBarButtonItem alloc] initWithTitle:@"退出" style:UIBarButtonItemStylePlain
-                                        target:self action:@selector(onLogout)],
+        [[UIBarButtonItem alloc] initWithTitle:@"设置" style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(onSettings)];
+    self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"钱包" style:UIBarButtonItemStylePlain
-                                        target:self action:@selector(onWallet)],
-    ];
+                                        target:self action:@selector(onWallet)];
     self.navigationItem.prompt = [NSString stringWithFormat:@"已登录 %@", masked];
 
     [self restoreLastDevice];
@@ -896,13 +893,26 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
     }
 }
 
-#pragma mark - 探针入口
+#pragma mark - 设置 / 钱包入口
+
+- (void)onSettings {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"设置"
+                                                               message:nil
+                                                        preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"探针（调试）" style:UIAlertActionStyleDefault
+                                          handler:^(UIAlertAction *a) { [ws onProbe]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"退出登录" style:UIAlertActionStyleDestructive
+                                          handler:^(UIAlertAction *a) { [ws onLogout]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    ac.popoverPresentationController.sourceView = self.view;
+    ac.popoverPresentationController.sourceRect = self.view.bounds;
+    [self presentViewController:ac animated:YES completion:nil];
+}
 
 - (void)onProbe {
     [self.navigationController pushViewController:[[ProbeViewController alloc] init] animated:YES];
 }
-
-#pragma mark - 钱包入口
 
 - (void)onWallet {
     [self.navigationController pushViewController:[[WalletViewController alloc] init] animated:YES];

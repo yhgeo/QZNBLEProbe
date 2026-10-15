@@ -18,12 +18,72 @@
 
 @interface KRWMBillItem : NSObject
 @property (nonatomic, copy) NSString *orderId;
-@property (nonatomic, copy) NSString *consumeDate;   // 原始 14 位，如 20261015204116
+/// 原始时间串。实测两种格式都出现过：`20261015204116` 与 `2026-10-15 20:41:16`
+@property (nonatomic, copy) NSString *consumeDate;
 @property (nonatomic, copy) NSString *consumeMoney;  // 元，字符串
-@property (nonatomic, copy) NSString *desc;          // 如 "龙川北苑3号楼南:320房"
+@property (nonatomic, copy) NSString *desc;          // 如 "热水表-工程学院北区-C6-5层-506"
 @end
 
 @implementation KRWMBillItem
+@end
+
+#pragma mark - 账单行（两行：日期+金额 / 完整描述）
+
+@interface KRWMBillCell : UITableViewCell
+@property (nonatomic, strong) UILabel *dateLabel;
+@property (nonatomic, strong) UILabel *moneyLabel;
+@property (nonatomic, strong) UILabel *descLabel;
+@end
+
+@implementation KRWMBillCell
+
+- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
+    self = [super initWithStyle:style reuseIdentifier:reuseIdentifier];
+    if (self) {
+        _dateLabel = [[UILabel alloc] init];
+        _dateLabel.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightRegular];
+        _dateLabel.textColor = [UIColor secondaryLabelColor];
+
+        _moneyLabel = [[UILabel alloc] init];
+        _moneyLabel.font = [UIFont monospacedDigitSystemFontOfSize:16 weight:UIFontWeightSemibold];
+        _moneyLabel.textColor = [UIColor labelColor];
+        _moneyLabel.textAlignment = NSTextAlignmentRight;
+        [_moneyLabel setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+        [_moneyLabel setContentCompressionResistancePriority:UILayoutPriorityRequired
+                                                     forAxis:UILayoutConstraintAxisHorizontal];
+
+        _descLabel = [[UILabel alloc] init];
+        _descLabel.font = [UIFont systemFontOfSize:13];
+        _descLabel.textColor = [UIColor labelColor];
+        _descLabel.numberOfLines = 1;
+        // 描述可能很长（如「热水表-工程学院北区-C6-5层-506」），缩字号而不是截断
+        _descLabel.adjustsFontSizeToFitWidth = YES;
+        _descLabel.minimumScaleFactor = 0.75;
+
+        for (UILabel *l in @[_dateLabel, _moneyLabel, _descLabel]) {
+            l.translatesAutoresizingMaskIntoConstraints = NO;
+            [self.contentView addSubview:l];
+        }
+
+        UILayoutGuide *g = self.contentView.layoutMarginsGuide;
+        [NSLayoutConstraint activateConstraints:@[
+            [_dateLabel.topAnchor constraintEqualToAnchor:g.topAnchor constant:10],
+            [_dateLabel.leadingAnchor constraintEqualToAnchor:g.leadingAnchor],
+
+            [_moneyLabel.centerYAnchor constraintEqualToAnchor:_dateLabel.centerYAnchor],
+            [_moneyLabel.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
+            [_moneyLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:_dateLabel.trailingAnchor
+                                                                   constant:8],
+
+            [_descLabel.topAnchor constraintEqualToAnchor:_dateLabel.bottomAnchor constant:4],
+            [_descLabel.leadingAnchor constraintEqualToAnchor:g.leadingAnchor],
+            [_descLabel.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
+            [_descLabel.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-10],
+        ]];
+    }
+    return self;
+}
+
 @end
 
 #pragma mark - 小工具
@@ -34,24 +94,25 @@ static NSString *KRWMStr(id obj) {
     return @"";
 }
 
-/// "20261015204116" → "10-15 20:41"
+/// 时间串 → "10-15 20:41"
+///
+/// 实测 `consumeDate` 两种写法都出现过：`20261015204116` 和 `2026-10-15 20:41:16`。
+/// 所以先把数字全部提出来再切，两种都能吃。
 static NSString *KRWMFormatBillDate(NSString *raw) {
-    if (raw.length < 12) return raw.length ? raw : @"—";
-    return [NSString stringWithFormat:@"%@-%@ %@:%@",
-            [raw substringWithRange:NSMakeRange(4, 2)],
-            [raw substringWithRange:NSMakeRange(6, 2)],
-            [raw substringWithRange:NSMakeRange(8, 2)],
-            [raw substringWithRange:NSMakeRange(10, 2)]];
-}
+    if (raw.length == 0) return @"—";
 
-/// "龙川北苑3号楼南:320房" → "320房"；没有冒号就原样返回
-static NSString *KRWMShortDesc(NSString *desc) {
-    if (desc.length == 0) return @"—";
-    NSRange r = [desc rangeOfString:@":"];
-    if (r.location != NSNotFound && r.location + 1 < desc.length) {
-        return [desc substringFromIndex:r.location + 1];
+    NSMutableString *digits = [NSMutableString string];
+    for (NSUInteger i = 0; i < raw.length; i++) {
+        unichar c = [raw characterAtIndex:i];
+        if (c >= '0' && c <= '9') [digits appendFormat:@"%C", c];
     }
-    return desc;
+    if (digits.length < 12) return raw;
+
+    return [NSString stringWithFormat:@"%@-%@ %@:%@",
+            [digits substringWithRange:NSMakeRange(4, 2)],
+            [digits substringWithRange:NSMakeRange(6, 2)],
+            [digits substringWithRange:NSMakeRange(8, 2)],
+            [digits substringWithRange:NSMakeRange(10, 2)]];
 }
 
 static NSArray<KRWMBillItem *> *KRWMParseBills(NSArray *raw) {
@@ -122,7 +183,9 @@ static NSString *KRWMMonthString(NSDate *date) {
     self.tableView.delegate = self;
     self.tableView.backgroundColor = [UIColor systemBackgroundColor];
     self.tableView.separatorInset = UIEdgeInsetsMake(0, 16, 0, 16);
-    self.tableView.rowHeight = 52;
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+    self.tableView.estimatedRowHeight = 68;
+    [self.tableView registerClass:[KRWMBillCell class] forCellReuseIdentifier:@"bill"];
     [self.view addSubview:self.tableView];
 
     self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
@@ -172,7 +235,7 @@ static NSString *KRWMMonthString(NSDate *date) {
                                       color:[UIColor secondaryLabelColor]];
     self.balanceLabel = [self makeLabel:@"¥ --" font:[UIFont monospacedDigitSystemFontOfSize:34 weight:UIFontWeightBold]
                                   color:[UIColor labelColor]];
-    self.givenLabel = [self makeLabel:@"赠送 ¥0.00" font:[UIFont systemFontOfSize:12]
+    self.givenLabel = [self makeLabel:@"赠送 ¥--" font:[UIFont systemFontOfSize:12]
                                 color:[UIColor secondaryLabelColor]];
 
     for (UIView *v in @[balanceTitle, self.balanceLabel, self.givenLabel]) {
@@ -283,13 +346,20 @@ static NSString *KRWMMonthString(NSDate *date) {
         [ws.spinner stopAnimating];
         if (!ok || data == nil) {
             ws.balanceLabel.text = @"¥ --";
-            [ws setMonthStat:@"加载失败"];
+            ws.givenLabel.text = @"赠送 ¥--";
             return;
         }
-        NSString *real = KRWMStr(data[@"accountRealMoney"]);
-        NSString *given = KRWMStr(data[@"accountGivenMoney"]);
-        ws.balanceLabel.text = [NSString stringWithFormat:@"¥ %@", real.length ? real : @"0.00"];
-        ws.givenLabel.text = [NSString stringWithFormat:@"赠送 ¥%@", given.length ? given : @"0.00"];
+
+        // ⚠️ `accountRealMoney` / `accountGivenMoney` 的单位是**厘**
+        //    （55460 表示 55.46 元），必须优先用 `money` 字符串字段——它已经是元。
+        NSString *moneyStr = KRWMStr(data[@"money"]);
+        double yuan = moneyStr.length
+            ? moneyStr.doubleValue
+            : [KRWMStr(data[@"accountRealMoney"]) doubleValue] / 1000.0;
+        double given = [KRWMStr(data[@"accountGivenMoney"]) doubleValue] / 1000.0;
+
+        ws.balanceLabel.text = [NSString stringWithFormat:@"¥ %.2f", yuan];
+        ws.givenLabel.text = [NSString stringWithFormat:@"赠送 ¥%.2f", given];
     }];
 }
 
@@ -326,14 +396,12 @@ static NSString *KRWMMonthString(NSDate *date) {
 }
 
 - (void)onPrevMonth {
-    NSDate *d = [self monthDateOffset:-1];
-    self.currentMonth = KRWMMonthString(d);
+    self.currentMonth = KRWMMonthString([self monthDateOffset:-1]);
     [self loadBills];
 }
 
 - (void)onNextMonth {
-    NSDate *d = [self monthDateOffset:1];
-    self.currentMonth = KRWMMonthString(d);
+    self.currentMonth = KRWMMonthString([self monthDateOffset:1]);
     [self loadBills];
 }
 
@@ -353,7 +421,7 @@ static NSString *KRWMMonthString(NSDate *date) {
         alertControllerWithTitle:@"充值请走官方渠道"
         message:@"本客户端只读取余额与消费记录，不涉及支付。\n\n"
                  "充值请在「趣智校园」官方 App 或微信公众号里完成，"
-                 "充完后回到本页下拉刷新即可看到新余额。"
+                 "充完后回到本页即可看到新余额。"
         preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:ac animated:YES completion:nil];
@@ -371,24 +439,14 @@ static NSString *KRWMMonthString(NSDate *date) {
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    static NSString *cellId = @"bill";
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cellId];
-    if (cell == nil) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:cellId];
-    }
-
+    KRWMBillCell *cell = [tableView dequeueReusableCellWithIdentifier:@"bill" forIndexPath:indexPath];
     KRWMBillItem *item = self.bills[indexPath.row];
-    NSString *room = KRWMShortDesc(item.desc);
 
-    cell.textLabel.text = [NSString stringWithFormat:@"%@  %@",
-                           KRWMFormatBillDate(item.consumeDate), room];
-    cell.textLabel.font = [UIFont systemFontOfSize:14];
-    cell.textLabel.textColor = [UIColor labelColor];
-
-    cell.detailTextLabel.text = [NSString stringWithFormat:@"¥%@", item.consumeMoney.length ? item.consumeMoney : @"0"];
-    cell.detailTextLabel.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightMedium];
-    cell.detailTextLabel.textColor = [UIColor labelColor];
-
+    cell.dateLabel.text = KRWMFormatBillDate(item.consumeDate);
+    cell.moneyLabel.text = [NSString stringWithFormat:@"¥%@",
+                            item.consumeMoney.length ? item.consumeMoney : @"0"];
+    // 完整显示，不再截断——名字长时缩字号
+    cell.descLabel.text = item.desc.length ? item.desc : @"—";
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     return cell;
 }
