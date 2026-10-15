@@ -299,10 +299,15 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
             [ws log:[NSString stringWithFormat:@"✅ 已连接 %@  %@",
                      p.name ?: @"(无名)", [p formattedMacAddress] ?: @"?"]];
 
-            // 关阀后重连：接着跑结算
+            // 关阀后重连：接着跑结算。
+            // 实测（runtime_log 10/10 轮）：重连后立刻发指令几乎必然超时 8 秒，
+            // 稍等 1 秒再执行——用 1 秒换 8 秒
             void (^next)(void) = ws.pendingReconnectBlock;
             ws.pendingReconnectBlock = nil;
-            if (next) next();
+            if (next) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), next);
+            }
         });
     };
 
