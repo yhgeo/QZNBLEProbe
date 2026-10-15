@@ -491,9 +491,96 @@ static NSString *KRWMQueryString(NSDictionary<NSString *, NSString *> *params) {
     [self postPath:@"/order/upload/bluetooth/fail" fields:fields authed:YES completion:completion];
 }
 
+#pragma mark - 自动验证专用（原样透传、不改写字段）
+
+- (void)uploadXfDataVerbatim:(NSString *)xfData
+                protocolType:(NSString *)protocolType
+                randomNumber:(NSString *)randomNumber
+                  completion:(KRWMCodeHandler)completion {
+
+    // 与 uploadXfData: 唯一的区别：**不转小写**。签名仍按小写原文算——
+    // 若服务端按收到的字段重算签名，就会对不上而报 170；这对付"服务端严格性"。
+    NSString *signedLower = [xfData lowercaseString];
+    NSString *raw = [KRWMCrypto rawFromParams:@{
+        @"loginCode": self.loginCode,
+        @"telephone": self.telephone,
+        @"xfData":    signedLower
+    }];
+    NSString *signature = [KRWMCrypto signRaw:raw sessionKey:self.loginCode];
+    if (signature == nil) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(NO, -1, nil, @"签名失败（登录态可能已失效）");
+        });
+        return;
+    }
+
+    NSMutableDictionary<NSString *, NSString *> *all = [NSMutableDictionary dictionary];
+    [all addEntriesFromDictionary:[self authFields]];
+    [all addEntriesFromDictionary:@{
+        @"protocolType": protocolType ?: @"",
+        @"randomNumber": [randomNumber lowercaseString],
+        @"xfData":       xfData ?: @"",
+        @"signature":    signature
+    }];
+
+    NSURL *url = [NSURL URLWithString:[kBaseURL stringByAppendingString:@"/order/upload/bluetooth/data"]];
+    if (url == nil) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(NO, -1, nil, @"接口地址无效");
+        });
+        return;
+    }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 20.0;
+    [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+    req.HTTPBody = [KRWMQueryString(all) dataUsingEncoding:NSUTF8StringEncoding];
+    [self applyConfigHeaders:req];
+
+    [self sendRaw:req completion:^(BOOL ok, NSDictionary *json, NSString *message) {
+        NSInteger code = [json[@"errorCode"] integerValue];
+        id dataField = json[@"data"];
+        NSDictionary *data = [dataField isKindOfClass:[NSDictionary class]] ? dataField : nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion([json[@"success"] boolValue], code, data, message ?: @"");
+        });
+    }];
+}
+
+- (void)queryOrderResult:(NSString *)orderNo
+                 snCode:(NSString *)snCode
+             completion:(KRWMCodeHandler)completion {
+
+    NSMutableDictionary<NSString *, NSString *> *all = [NSMutableDictionary dictionary];
+    [all addEntriesFromDictionary:[self authFields]];
+    [all addEntriesFromDictionary:@{ @"orderNo": orderNo ?: @"", @"snCode": snCode ?: @"" }];
+
+    NSURL *url = [NSURL URLWithString:[kBaseURL stringByAppendingString:@"/order/consumeOrder/result/query"]];
+    if (url == nil) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(NO, -1, nil, @"接口地址无效");
+        });
+        return;
+    }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 15.0;
+    [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+    req.HTTPBody = [KRWMQueryString(all) dataUsingEncoding:NSUTF8StringEncoding];
+    [self applyConfigHeaders:req];
+
+    [self sendRaw:req completion:^(BOOL ok, NSDictionary *json, NSString *message) {
+        NSInteger code = [json[@"errorCode"] integerValue];
+        id dataField = json[@"data"];
+        NSDictionary *data = [dataField isKindOfClass:[NSDictionary class]] ? dataField : nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion([json[@"success"] boolValue], code, data, message ?: @"");
+        });
+    }];
+}
+
 /// 返回完整 JSON（不只是 data 字段），供上传接口判定 errorCode 用
-- (void)sendRaw:(NSURLRequest *)req completion:(void (^)(BOOL ok, NSDictionary *json, NSString *message))completion {
-    NSURLSessionDataTask *task =
+- (void)sendRaw:(NSURLRequest *)req completion:(void (^)(BOOL ok, NSDictionary *json, NSString *message))completion {    NSURLSessionDataTask *task =
         [[NSURLSession sharedSession] dataTaskWithRequest:req
                                         completionHandler:^(NSData *data, NSURLResponse *resp, NSError *error) {
         if (error || data.length == 0) {

@@ -19,6 +19,10 @@ typedef void (^KRWMResponseHandler)(BOOL ok, NSDictionary * _Nullable data, NSSt
 /// 列表型接口的回调（账单列表的 data 是数组，不是字典）
 typedef void (^KRWMListHandler)(BOOL ok, NSArray * _Nullable list, NSString *message);
 
+/// 带原始 `errorCode` 的回调。自动验证要用它区分 170 / 226 / 0，普通业务回调拿不到码。
+typedef void (^KRWMCodeHandler)(BOOL success, NSInteger errorCode,
+                                NSDictionary * _Nullable data, NSString *message);
+
 @interface KRWMClient : NSObject
 
 + (instancetype)shared;
@@ -93,6 +97,23 @@ typedef void (^KRWMListHandler)(BOOL ok, NSArray * _Nullable list, NSString *mes
 /// @return 数组元素为 `{"consumeBillDTO": {...}}`
 - (void)loadBillsForMonth:(nullable NSString *)month
                completion:(KRWMListHandler)completion;
+
+#pragma mark - 自动验证专用（原样透传、不改写字段）
+
+/// 上传消费数据，但**原样**发送 `xfData`（不做小写归一）。
+///
+/// 用途：验证服务端到底是"按收到的 xfData 重算签名"还是"只校验签名自洽"——
+/// 故意送大写即可触发 170。**这是唯一的区别**，其余字段与 `uploadXfData:` 完全一致。
+- (void)uploadXfDataVerbatim:(NSString *)xfData
+                protocolType:(NSString *)protocolType
+                randomNumber:(NSString *)randomNumber
+                  completion:(KRWMCodeHandler)completion;
+
+/// 查询某笔订单的服务端结算结果（`POST /order/consumeOrder/result/query`）。
+/// 用来与上传响应、账单列表做三方金额比对。
+- (void)queryOrderResult:(NSString *)orderNo
+                 snCode:(NSString *)snCode
+             completion:(KRWMCodeHandler)completion;
 
 #pragma mark - MAC 换算
 

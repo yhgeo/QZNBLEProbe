@@ -7,6 +7,7 @@
 //
 
 #import "ProbeViewController.h"
+#import "LEDVerifyRunner.h"
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <QZNOSDK/KRWaterMeterKit.h>
 
@@ -73,6 +74,11 @@ static NSString *RespStateName(KRSyncResponseState s) {
 @property (nonatomic, strong) UIButton *clearBtn;
 @property (nonatomic, strong) UIButton *tradeBtn;
 @property (nonatomic, strong) UIButton *stopBtn;
+@property (nonatomic, strong) UIButton *verifyBtn;
+@property (nonatomic, strong) UIButton *reportBtn;
+
+@property (nonatomic, strong) LEDVerifyRunner *verifier;
+@property (nonatomic, copy)   NSString *lastVerifyReport;
 
 @property (nonatomic, strong) NSMutableString *log;
 @property (nonatomic, strong) NSMutableArray<NSString *> *report;   // 只存有效信息，供「复制」输出
@@ -91,6 +97,9 @@ static NSString *RespStateName(KRSyncResponseState s) {
 - (void)doClearConsumption;
 - (void)onTryTransaction;
 - (void)onStopTransaction;
+- (void)onVerify;
+- (void)onCopyReport;
+- (void)doWriteBackProbe;
 
 @end
 
@@ -149,6 +158,8 @@ static NSString *RespStateName(KRSyncResponseState s) {
     self.clearBtn = [self makeButton:@"清消费" action:@selector(onClearConsumption)];
     self.tradeBtn = [self makeButton:@"试交易" action:@selector(onTryTransaction)];
     self.stopBtn  = [self makeButton:@"停交易" action:@selector(onStopTransaction)];
+    self.verifyBtn = [self makeButton:@"自动验证" action:@selector(onVerify)];
+    self.reportBtn = [self makeButton:@"复制报告" action:@selector(onCopyReport)];
 
     UIButton *copyBtn  = [self makeButton:@"复制" action:@selector(onCopy)];
     UIButton *resetBtn = [self makeButton:@"清空" action:@selector(onClear)];
@@ -158,6 +169,8 @@ static NSString *RespStateName(KRSyncResponseState s) {
     self.clearBtn.enabled = NO;
     self.tradeBtn.enabled = NO;
     self.stopBtn.enabled = NO;
+    self.verifyBtn.enabled = NO;
+    self.reportBtn.enabled = NO;
 
     // 有风险的写操作按钮标红
     self.tradeBtn.tintColor = [UIColor systemRedColor];
@@ -167,9 +180,12 @@ static NSString *RespStateName(KRSyncResponseState s) {
                          @[self.scanBtn, self.probeBtn, self.cmdBtn]];
     UIStackView *row2 = [[UIStackView alloc] initWithArrangedSubviews:
                          @[self.clearBtn, self.tradeBtn, self.stopBtn]];
+    // 自检两个按钮单独一行，避免和写操作挤在一起误触
+    UIStackView *row2b = [[UIStackView alloc] initWithArrangedSubviews:
+                          @[self.verifyBtn, self.reportBtn]];
     UIStackView *row3 = [[UIStackView alloc] initWithArrangedSubviews:
                          @[copyBtn, resetBtn]];
-    for (UIStackView *r in @[row1, row2, row3]) {
+    for (UIStackView *r in @[row1, row2, row2b, row3]) {
         r.translatesAutoresizingMaskIntoConstraints = NO;
         r.axis = UILayoutConstraintAxisHorizontal;
         r.distribution = UIStackViewDistributionFillEqually;
@@ -197,7 +213,12 @@ static NSString *RespStateName(KRSyncResponseState s) {
         [row2.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [row2.heightAnchor constraintEqualToConstant:40],
 
-        [row3.topAnchor constraintEqualToAnchor:row2.bottomAnchor constant:8],
+        [row2b.topAnchor constraintEqualToAnchor:row2.bottomAnchor constant:8],
+        [row2b.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+        [row2b.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+        [row2b.heightAnchor constraintEqualToConstant:40],
+
+        [row3.topAnchor constraintEqualToAnchor:row2b.bottomAnchor constant:8],
         [row3.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [row3.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [row3.heightAnchor constraintEqualToConstant:40],
@@ -236,6 +257,8 @@ static NSString *RespStateName(KRSyncResponseState s) {
             ws.probeBtn.enabled = YES;
             ws.cmdBtn.enabled = YES;
             ws.stopBtn.enabled = YES;   // 紧急停止随时可用
+            ws.verifyBtn.enabled = YES;
+            ws.reportBtn.enabled = (ws.lastVerifyReport.length > 0);
         });
     };
 
@@ -256,6 +279,7 @@ static NSString *RespStateName(KRSyncResponseState s) {
             ws.clearBtn.enabled = NO;
             ws.tradeBtn.enabled = NO;
             ws.stopBtn.enabled = NO;
+            ws.verifyBtn.enabled = NO;
         });
     };
 }
@@ -570,6 +594,80 @@ static NSString *RespStateName(KRSyncResponseState s) {
                 ws.busy = NO;
             });
         }];
+}
+
+#pragma mark - 自动验证（把 PROTOCOL.md 的疑点做成可重复执行的检查）
+
+/// 阶段 A 全是只读指令；阶段 B 的写回是独立按钮，必须再确认一次
+- (void)onVerify {
+    if (self.busy) { [self log:@"⚠️ 上一次操作还没结束"]; return; }
+    if (!self.connected) { [self log:@"⚠️ 请先连接设备"]; return; }
+
+    self.busy = YES;
+    self.verifyBtn.enabled = NO;
+    self.probeBtn.enabled = NO;
+    [self log:@""];
+    [self log:@"自动验证会依次做：读状态 / 采集(0x85) / 多帧比对 / 服务端会话校验 / 签名严格性 / 金额三方比对。"];
+    [self log:@"全部只读（不开阀、不关阀）；写回设备是另一个按钮。"];
+
+    __weak typeof(self) ws = self;
+    self.verifier = [[LEDVerifyRunner alloc] init];
+    [self.verifier startWithPeripheral:self.connected
+                                   log:^(NSString *line) { [ws report:line]; }
+                            completion:^(NSString *report) {
+        ws.busy = NO;
+        ws.verifyBtn.enabled = (ws.connected != nil);
+        ws.probeBtn.enabled = (ws.connected != nil);
+        ws.lastVerifyReport = report;
+        ws.reportBtn.enabled = YES;
+        [ws report:@""];
+        [ws report:@"✅ 自动验证结束。点「复制报告」取走 Markdown，可直接贴进 PROTOCOL.md。"];
+
+        // 有可回传的采集样本时，提示要不要做写操作那一项
+        if (ws.verifier.results.count > 0) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ [ws offerWriteBackProbe]; });
+        }
+    }];
+}
+
+- (void)offerWriteBackProbe {
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"还要做「写回」这一项吗？"
+        message:@"把刚采集到的 0x85 原文按 0x86 原样回传给设备，看它是否买账。\n\n"
+                 @"这一步是写操作，会让设备从「待采集」回到「空闲」。\n"
+                 @"只有当设备上确实还留着未结算记录时才需要做；设备已空闲就跳过。"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"跳过" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"回传测试" style:UIAlertActionStyleDestructive
+                                          handler:^(UIAlertAction *a) { [ws doWriteBackProbe]; }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)doWriteBackProbe {
+    self.busy = YES;
+    self.reportBtn.enabled = NO;
+    __weak typeof(self) ws = self;
+    [self.verifier runWriteBackProbeWithLog:^(NSString *line) { [ws report:line]; }
+                                 completion:^(BOOL acked, BOOL cleared, NSString *detail) {
+        ws.busy = NO;
+        ws.reportBtn.enabled = YES;
+        ws.lastVerifyReport = [ws.verifier markdownReport];
+        [ws report:[NSString stringWithFormat:@"写回测试结果：ACK=%@ 记录已清=%@\n%@",
+                    acked ? @"是" : @"否", cleared ? @"是" : @"否", detail]];
+        [ws report:@"点「复制报告」取走完整 Markdown。"];
+    }];
+}
+
+- (void)onCopyReport {
+    if (self.lastVerifyReport.length == 0) {
+        [self log:@"⚠️ 还没有验证报告（请先点「自动验证」）"];
+        return;
+    }
+    [UIPasteboard generalPasteboard].string = self.lastVerifyReport;
+    [self log:[NSString stringWithFormat:@"📋 验证报告已复制（%lu 字符）",
+               (unsigned long)self.lastVerifyReport.length]];
 }
 
 #pragma mark - SDK 内部日志
