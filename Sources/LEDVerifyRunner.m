@@ -209,6 +209,21 @@ static NSDictionary *LEDInspectFrame(NSString *orig, unsigned int expectFunCode)
     };
 }
 
+#pragma mark - 主类私有接口
+
+/// `addResult:` / `log:` 必须在 `LEDSelfTestAgainstRealSample` **之前**声明——
+/// 那个静态函数要用它们；不声明就会报
+/// `no visible @interface ... declares the selector`（首版构建就是栽在这）。
+/// 其余属性留在下面那个扩展里，两个扩展会合并成同一个类扩展。
+@interface LEDVerifyRunner (PrivateAPI)
+- (void)log:(NSString *)line;
+- (void)addResult:(NSString *)ident
+            title:(NSString *)title
+          verdict:(NSString *)verdict
+           detail:(NSString *)detail
+         evidence:(NSString *)evidence;
+@end
+
 /// 用真机实测样本做一次离线自检：确认字段偏移没写错。
 ///
 /// 样本来自探针真机日志（PROTOCOL.md §16.2），字段值已知，可当回归用例。

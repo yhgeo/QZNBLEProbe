@@ -94,7 +94,7 @@ typedef void (^KRWMCodeHandler)(BOOL success, NSInteger errorCode,
 /// 水费账单列表（`GET /order/query/account/bill/list`）
 ///
 /// @param month 形如 `2026-10`；传 nil 取服务端默认（本月）
-/// @return 数组元素为 `{"consumeBillDTO": {...}}`
+/// 回调 `list` 的元素形如 `{"consumeBillDTO": {...}}`
 - (void)loadBillsForMonth:(nullable NSString *)month
                completion:(KRWMListHandler)completion;
 
