@@ -14,6 +14,7 @@
 #import "MainViewController.h"
 #import "KRWMClient.h"
 #import "KRWMCrypto.h"
+#import "ProbeViewController.h"
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <QZNOSDK/KRWaterMeterKit.h>
 
@@ -104,6 +105,15 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, strong) UIButton *scanButton;
 @property (nonatomic, strong) UIButton *actionButton;
+/// 未连接时显示的「重连上次设备」快捷入口
+@property (nonatomic, strong) UIButton *lastDeviceButton;
+
+/// 上次成功连接过的设备（本地记住，省去每次重新扫描挑选）
+@property (nonatomic, copy)   NSString *lastDeviceName;
+@property (nonatomic, copy)   NSString *lastDeviceIdentifier;
+@property (nonatomic, copy)   NSString *lastDeviceMac;
+/// 正在「重连上次设备」——扫描时匹配到目标就自动连，不再弹列表
+@property (nonatomic, assign) BOOL reconnectingLast;
 
 @property (nonatomic, strong) NSMutableString *log;
 @property (nonatomic, strong) NSMutableArray<CBPeripheral *> *found;
@@ -150,11 +160,15 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
     NSString *masked = phone.length == 11
         ? [phone stringByReplacingCharactersInRange:NSMakeRange(3, 4) withString:@"****"]
         : phone;
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"探针" style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(onProbe)];
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"退出" style:UIBarButtonItemStylePlain
                                         target:self action:@selector(onLogout)];
     self.navigationItem.prompt = [NSString stringWithFormat:@"已登录 %@", masked];
 
+    [self restoreLastDevice];
     [self refreshActionButton];
 
     [self log:@"① 点「扫描」→ ② 再点「扫描」结束并选设备 → ③ 点「开始用水」"];
@@ -182,6 +196,14 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
     self.actionButton = [self makeButton:@"开始用水" action:@selector(onAction)];
     self.actionButton.enabled = NO;
 
+    // 「重连上次设备」——链接样式，未连接且有历史记录时才出现
+    self.lastDeviceButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.lastDeviceButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    self.lastDeviceButton.titleLabel.font = [UIFont systemFontOfSize:14];
+    self.lastDeviceButton.hidden = YES;
+    [self.lastDeviceButton addTarget:self action:@selector(onReconnectLast)
+                    forControlEvents:UIControlEventTouchUpInside];
+
     self.logView = [[UITextView alloc] init];
     self.logView.editable = NO;
     self.logView.selectable = YES;
@@ -196,22 +218,25 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
     buttons.distribution = UIStackViewDistributionFillEqually;
     buttons.spacing = 10;
 
-    for (UIView *v in @[self.deviceLabel, self.infoLabel, buttons, self.logView]) {
+    UIStackView *header = [[UIStackView alloc] initWithArrangedSubviews:@[
+        self.deviceLabel, self.infoLabel, self.lastDeviceButton
+    ]];
+    header.axis = UILayoutConstraintAxisVertical;
+    header.spacing = 6;
+    header.alignment = UIStackViewAlignmentFill;
+
+    for (UIView *v in @[header, buttons, self.logView]) {
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [self.view addSubview:v];
     }
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [self.deviceLabel.topAnchor constraintEqualToAnchor:safe.topAnchor constant:12],
-        [self.deviceLabel.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
-        [self.deviceLabel.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+        [header.topAnchor constraintEqualToAnchor:safe.topAnchor constant:12],
+        [header.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+        [header.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
 
-        [self.infoLabel.topAnchor constraintEqualToAnchor:self.deviceLabel.bottomAnchor constant:6],
-        [self.infoLabel.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
-        [self.infoLabel.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
-
-        [buttons.topAnchor constraintEqualToAnchor:self.infoLabel.bottomAnchor constant:12],
+        [buttons.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:12],
         [buttons.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [buttons.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [buttons.heightAnchor constraintEqualToConstant:48],
@@ -246,6 +271,8 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
         dispatch_async(dispatch_get_main_queue(), ^{
             ws.connected = p;
             ws.lastPeripheral = p;
+            ws.reconnectingLast = NO;
+            [ws rememberDevice:p];
             [ws updateDeviceLabel];
             // 连接成功后必须刷新主按钮，否则「开始用水」会一直停在禁用状态
             [ws refreshActionButton];
@@ -277,20 +304,70 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
     };
 }
 
+#pragma mark - 上次设备
+
+static NSString * const kPrefLastDeviceName = @"qzn.lastDevice.name";
+static NSString * const kPrefLastDeviceId   = @"qzn.lastDevice.identifier";
+static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
+
+- (void)rememberDevice:(CBPeripheral *)p {
+    self.lastDeviceName = p.name.length ? p.name : @"(无名)";
+    self.lastDeviceIdentifier = p.identifier.UUIDString;
+    self.lastDeviceMac = [p formattedMacAddress] ?: @"";
+
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setObject:self.lastDeviceName forKey:kPrefLastDeviceName];
+    [d setObject:self.lastDeviceIdentifier forKey:kPrefLastDeviceId];
+    [d setObject:self.lastDeviceMac forKey:kPrefLastDeviceMac];
+    [d synchronize];
+}
+
+- (void)restoreLastDevice {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    self.lastDeviceName = [d stringForKey:kPrefLastDeviceName];
+    self.lastDeviceIdentifier = [d stringForKey:kPrefLastDeviceId];
+    self.lastDeviceMac = [d stringForKey:kPrefLastDeviceMac];
+}
+
+/// 「重连上次设备」入口的标题与可见性
+- (void)refreshLastDeviceButton {
+    BOOL show = (self.connected == nil) && (self.lastDeviceName.length > 0);
+    self.lastDeviceButton.hidden = !show;
+    if (show) {
+        [self.lastDeviceButton setTitle:[NSString stringWithFormat:@"🔄 重连上次：%@", self.lastDeviceName]
+                               forState:UIControlStateNormal];
+    }
+}
+
+/// 快捷重连：扫描并匹配上次那台设备，扫到就直接连
+- (void)onReconnectLast {
+    if (self.busy) { [self log:@"⚠️ 正在处理中，请稍候"]; return; }
+    if (self.lastDeviceIdentifier.length == 0) { [self log:@"⚠️ 没有可重连的历史设备"]; return; }
+
+    [self log:[NSString stringWithFormat:@"正在寻找上次的设备「%@」…", self.lastDeviceName]];
+    self.reconnectingLast = YES;
+    [self startScan];
+}
+
 #pragma mark - 扫描 / 连接
 
 - (void)onScan {
     if (self.busy) { [self log:@"⚠️ 正在处理中，请稍候"]; return; }
-    KRWMCore *core = [KRWMCore sharedCore];
+    self.reconnectingLast = NO;      // 手动扫描＝要重新挑设备
 
     if (self.scanning) {
-        [core stopScan];
+        [[KRWMCore sharedCore] stopScan];
         self.scanning = NO;
         [self.scanButton setTitle:@"扫描" forState:UIControlStateNormal];
         [self log:[NSString stringWithFormat:@"扫描结束，共发现 %lu 个设备", (unsigned long)self.found.count]];
         [self pickDevice];
         return;
     }
+    [self startScan];
+}
+
+- (void)startScan {
+    KRWMCore *core = [KRWMCore sharedCore];
 
     [self.found removeAllObjects];
     [self log:@""];
@@ -308,6 +385,16 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
                      (unsigned long)ws.found.count,
                      aPeripheral.name ?: @"(无名)",
                      [aPeripheral formattedMacAddress] ?: @""]];
+
+            // 快捷重连模式：扫到目标设备立刻连，不用等用户操作
+            if (ws.reconnectingLast &&
+                [aPeripheral.identifier.UUIDString isEqualToString:ws.lastDeviceIdentifier]) {
+                [core stopScan];
+                ws.scanning = NO;
+                [ws.scanButton setTitle:@"扫描" forState:UIControlStateNormal];
+                [ws log:@"找到上次的设备，正在连接…"];
+                [core connectPeripheral:aPeripheral];
+            }
         });
     }];
 }
@@ -348,17 +435,19 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
 }
 
 - (void)refreshActionButton {
-    self.actionButton.enabled = (self.connected != nil) && !self.busy;
-    if (self.startedAt > 0) {
-        [self.actionButton setTitle:@"停止用水" forState:UIControlStateNormal];
-        self.actionButton.backgroundColor = [UIColor systemRedColor];
-        [self.actionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    } else {
-        [self.actionButton setTitle:@"开始用水" forState:UIControlStateNormal];
-        self.actionButton.backgroundColor = [UIColor systemBlueColor];
-        [self.actionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    }
+    BOOL canAct = (self.connected != nil) && !self.busy;
+    self.actionButton.enabled = canAct;
+
+    // 禁用态必须显式置灰：UIButton 的 backgroundColor 不会随 enabled 自动变
+    self.actionButton.backgroundColor = canAct
+        ? (self.startedAt > 0 ? [UIColor systemRedColor] : [UIColor systemBlueColor])
+        : [UIColor systemGrayColor];
+    [self.actionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [self.actionButton setTitle:(self.startedAt > 0 ? @"停止用水" : @"开始用水")
+                       forState:UIControlStateNormal];
+
     self.scanButton.enabled = !self.busy;
+    [self refreshLastDeviceButton];
 }
 
 #pragma mark - 主操作
@@ -387,13 +476,27 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
 - (void)beginOpenFlow {
     self.busy = YES;
     [self refreshActionButton];
+    [self readStateAttempt:1];
+}
 
+/// 读设备状态。刚重连上来时设备常常还没准备好，首次无响应属常见——自动退避重试
+- (void)readStateAttempt:(NSInteger)attempt {
+    self.deviceState = nil;
     __weak typeof(self) ws = self;
     [[KRWMCore sharedCore] krGetStateOfDevice:^(KRSyncType t, NSData *d, NSString *orig) {
         dispatch_async(dispatch_get_main_queue(), ^{ ws.deviceState = KRWMParseStatePayload(d); });
     } result:^(KRSyncType t, KRSyncResponseState s) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (s != KRSyncResponseStateSuccess || ws.deviceState == nil) {
+                if (attempt < 3) {
+                    [ws log:[NSString stringWithFormat:@"第 %ld 次读取状态无响应，稍后重试…", (long)attempt]];
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                 (int64_t)(0.8 * attempt * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        [ws readStateAttempt:attempt + 1];
+                    });
+                    return;
+                }
                 [ws fail:@"读取设备状态失败，请靠近设备重试"];
                 return;
             }
@@ -744,11 +847,17 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
     [self refreshActionButton];
     [self updateInfoLabel];
 
-    // 保持连接：结算流程里已经断开重连过一次，连接是活的。
-    // 用户可以直接再点「开始用水」，不必重新扫描。
+    // 结算完主动断开：这是公共设备，用完要让给别人连
     if (self.connected) {
-        [self log:@"（连接保持中，可直接再次点「开始用水」）"];
+        [self log:@"已断开连接，把设备让给其他人使用。"];
+        [[KRWMCore sharedCore] disconnect];
     }
+}
+
+#pragma mark - 探针入口
+
+- (void)onProbe {
+    [self.navigationController pushViewController:[[ProbeViewController alloc] init] animated:YES];
 }
 
 #pragma mark - 退出登录
