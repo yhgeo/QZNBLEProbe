@@ -68,12 +68,21 @@ static NSString *RespStateName(KRSyncResponseState s) {
 @property (nonatomic, strong) UIButton *scanBtn;
 @property (nonatomic, strong) UIButton *probeBtn;
 @property (nonatomic, strong) UIButton *cmdBtn;
+@property (nonatomic, strong) UIButton *clearBtn;
 
 @property (nonatomic, strong) NSMutableString *log;
 @property (nonatomic, strong) NSMutableArray<CBPeripheral *> *found;
 @property (nonatomic, strong) CBPeripheral *connected;
+@property (nonatomic, strong) NSData *lastXfData;      // 最近一次采集到的消费原始数据
 @property (nonatomic, assign) BOOL scanning;
 @property (nonatomic, assign) BOOL busy;
+
+// 前置声明，避免「no visible @interface declares the selector」警告
+- (void)dumpSDKLog;
+- (void)parseState:(NSData *)d;
+- (void)parseConsumption:(NSData *)d;
+- (void)onClearConsumption;
+- (void)doClearConsumption;
 
 @end
 
@@ -121,20 +130,26 @@ static NSString *RespStateName(KRSyncResponseState s) {
     self.scanBtn  = [self makeButton:@"扫描" action:@selector(onScan)];
     self.probeBtn = [self makeButton:@"探测" action:@selector(onProbe)];
     self.cmdBtn   = [self makeButton:@"指令" action:@selector(onCustomCommand)];
+    self.clearBtn = [self makeButton:@"清消费" action:@selector(onClearConsumption)];
 
     UIButton *copyBtn  = [self makeButton:@"复制" action:@selector(onCopy)];
-    UIButton *clearBtn = [self makeButton:@"清空" action:@selector(onClear)];
+    UIButton *resetBtn = [self makeButton:@"清空" action:@selector(onClear)];
 
     self.probeBtn.enabled = NO;
     self.cmdBtn.enabled = NO;
+    self.clearBtn.enabled = NO;
 
-    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:
-                        @[self.scanBtn, self.probeBtn, self.cmdBtn, copyBtn, clearBtn]];
-    row.translatesAutoresizingMaskIntoConstraints = NO;
-    row.axis = UILayoutConstraintAxisHorizontal;
-    row.distribution = UIStackViewDistributionFillEqually;
-    row.spacing = 8;
-    [self.view addSubview:row];
+    UIStackView *row1 = [[UIStackView alloc] initWithArrangedSubviews:
+                         @[self.scanBtn, self.probeBtn, self.cmdBtn]];
+    UIStackView *row2 = [[UIStackView alloc] initWithArrangedSubviews:
+                         @[self.clearBtn, copyBtn, resetBtn]];
+    for (UIStackView *r in @[row1, row2]) {
+        r.translatesAutoresizingMaskIntoConstraints = NO;
+        r.axis = UILayoutConstraintAxisHorizontal;
+        r.distribution = UIStackViewDistributionFillEqually;
+        r.spacing = 8;
+        [self.view addSubview:r];
+    }
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -146,11 +161,16 @@ static NSString *RespStateName(KRSyncResponseState s) {
         [self.logView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [self.logView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
 
-        [row.topAnchor constraintEqualToAnchor:self.logView.bottomAnchor constant:8],
-        [row.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
-        [row.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
-        [row.heightAnchor constraintEqualToConstant:40],
-        [row.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8],
+        [row1.topAnchor constraintEqualToAnchor:self.logView.bottomAnchor constant:8],
+        [row1.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+        [row1.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+        [row1.heightAnchor constraintEqualToConstant:40],
+
+        [row2.topAnchor constraintEqualToAnchor:row1.bottomAnchor constant:8],
+        [row2.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+        [row2.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+        [row2.heightAnchor constraintEqualToConstant:40],
+        [row2.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8],
     ]];
 }
 
@@ -344,7 +364,7 @@ static NSString *RespStateName(KRSyncResponseState s) {
                 [ws log:[NSString stringWithFormat:@"    → 结果: %@", RespStateName(s)]];
                 [ws log:@""];
                 [ws log:@"========== 探测结束 =========="];
-                [ws log:@"点右上「复制」把日志发出来，我来分析报文布局。"];
+                [ws dumpSDKLog];
                 ws.busy = NO;
                 ws.probeBtn.enabled = YES;
             });
@@ -400,6 +420,61 @@ static NSString *RespStateName(KRSyncResponseState s) {
         }];
 }
 
+#pragma mark - 清除消费数据（写操作）
+
+- (void)onClearConsumption {
+    if (self.busy) { [self log:@"⚠️ 上一次操作还没结束"]; return; }
+    if (!self.connected) { [self log:@"⚠️ 请先连接设备"]; return; }
+    if (self.lastXfData.length == 0) { [self log:@"⚠️ 请先点「探测」采集到消费数据"]; return; }
+
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"清除设备消费数据"
+        message:[NSString stringWithFormat:
+                 @"将把采集到的原始数据原样回传给设备：\n\n%@\n\n"
+                 @"⚠️ 这是写操作，会让设备从「待采集」回到「空闲」。确定继续？",
+                 [KRWMUtils bytesStringWithData:self.lastXfData]]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"确定发送" style:UIAlertActionStyleDestructive
+                                          handler:^(UIAlertAction *a) { [ws doClearConsumption]; }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)doClearConsumption {
+    self.busy = YES;
+    [self log:@""];
+    [self log:@"===== 清除消费数据 krClearConsumptionDetails ====="];
+    [self log:[NSString stringWithFormat:@"发送 data = %@", [KRWMUtils bytesStringWithData:self.lastXfData]]];
+
+    __weak typeof(self) ws = self;
+    [[KRWMCore sharedCore] krClearConsumptionDetails:self.lastXfData
+        dataCallback:^(KRSyncType t, NSData *d, NSString *orig) {
+            dispatch_async(dispatch_get_main_queue(), ^{ [ws dumpRaw:@"清除响应" data:d original:orig]; });
+        } result:^(KRSyncType t, KRSyncResponseState s) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [ws log:[NSString stringWithFormat:@"    → 结果: %@ (%@)", RespStateName(s), SyncTypeName(t)]];
+                [ws dumpSDKLog];
+                [ws log:@"下一步：再点一次「探测」，看设备是否已回到空闲状态。"];
+                ws.busy = NO;
+            });
+        }];
+}
+
+#pragma mark - SDK 内部日志
+
+- (void)dumpSDKLog {
+    NSMutableString *s = [KRWMCore sharedCore].AllLogString;
+    [self log:@""];
+    [self log:@"===== SDK 内部日志（含收发的原始帧）====="];
+    if (s.length == 0) {
+        [self log:@"(空)"];
+    } else {
+        [self log:s];
+    }
+    [self log:@"===== SDK 日志结束 ====="];
+}
+
 #pragma mark - 报文解析
 
 - (void)dumpRaw:(NSString *)tag data:(NSData *)d original:(NSString *)orig {
@@ -434,6 +509,11 @@ static NSString *RespStateName(KRSyncResponseState s) {
 - (void)parseConsumption:(NSData *)d {
     KRConsumptionDetailsObject *cd = [KRConsumptionDetailsObject consumptionDetailsObjectWithDetailsFromData:d];
     if (!cd) { [self log:@"      (消费详情解析失败)"]; return; }
+
+    // 保存原始消费数据，供「清消费」回传给设备
+    self.lastXfData = cd.xfData;
+    self.clearBtn.enabled = (cd.xfData.length > 0);
+
     [self log:@"      --- 消费字段 ---"];
     [self log:[NSString stringWithFormat:@"      ★ rate(费率)       = %@   ← 关键！", cd.rate]];
     [self log:[NSString stringWithFormat:@"      ykMoney(预扣)      = %@ 厘", cd.ykMoney]];
