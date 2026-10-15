@@ -45,7 +45,48 @@
 - 长度字段 = payload 长度 + 3
 - 校验和 = `(control + funCode + 0x00 + Σpayload) & 0xFF`（两帧全部吻合）
 - 实测功能码：`0x85` = 读消费详情，`0x18` = 读设备类型
-- 设备响应帧的 control 固定为 `0x81`
+- 设备响应帧的 control 固定为 `0x81`，发送帧为 `0x80`
+
+### 功能码表（真机实测 + 反汇编交叉验证）
+
+| funCode | 操作 | 验证方式 |
+|---|---|---|
+| `0x18` | 读设备类型 | 真机 |
+| `0x23` | 读设备状态 | 真机 + 反汇编（`krGetStateOfDevice` 内 `movz w3,#0x23`） |
+| `0x31` | **开始交易（放水）** | 反汇编（`krTransactionRateForDetails` 内 `movz w3,#0x31`） |
+| `0x32` | **结束交易** | 反汇编（`krEndTransactionMAXType` 内 `movz w3,#0x32`） |
+| `0x85` | 读消费详情 | 真机 |
+| `0x86` | 清除消费数据 | 真机 |
+
+### 已确认的重要行为
+
+- **清除消费数据不需要 tac**：`krClearConsumptionDetails:` 的 payload 就是
+  采集到的 `xfData` 原样回传，设备回 `81 01` 表示成功。
+  清除后设备从「待采集」回到可读状态（读状态不再超时）。
+- **`krTransactionRateForDetails:` 只是转发外部 data**：SDK 内部不做任何构造，
+  payload 格式完全由调用方决定。头文件注释引用的 `KRTransactionObject` /
+  `KRRateObject` 在二进制里**根本不存在**（已用符号表确认）。
+- **SDK 的 payload 是手工按字节拼的**：例如 `krAssignNumForDevice:productId:`
+  内部固定构造 8 字节 payload。
+
+### 设备状态 payload（48 字节，部分字段）
+
+| 偏移 | 长度 | 字段 |
+|---|---|---|
+| 0 | 1 | 固定标志 `0x80` |
+| 1 | 4 | productId |
+| 5 | 4 | deviceId |
+| 9 | 4 | accountId |
+| 13 | 6 | macAddress |
+| 19 | 1 | 单字节字段（onCharge / status 之一） |
+| 20 | 1 | 单字节字段 |
+| 21 | 2 | 双字节字段（疑似 maxType/minType） |
+| 23 | 1 | 单字节字段 |
+| 24 | 4 | 四字节字段 |
+| 28–31 | 4 | 单字节字段组 |
+| 41 | 7 | reserved（全零） |
+
+单字节字段与 `KRStateObject` 属性的精确对应关系尚未完全确定。
 
 消费详情 payload（62 字节）字段布局：
 

@@ -69,11 +69,14 @@ static NSString *RespStateName(KRSyncResponseState s) {
 @property (nonatomic, strong) UIButton *probeBtn;
 @property (nonatomic, strong) UIButton *cmdBtn;
 @property (nonatomic, strong) UIButton *clearBtn;
+@property (nonatomic, strong) UIButton *tradeBtn;
+@property (nonatomic, strong) UIButton *stopBtn;
 
 @property (nonatomic, strong) NSMutableString *log;
 @property (nonatomic, strong) NSMutableArray<CBPeripheral *> *found;
 @property (nonatomic, strong) CBPeripheral *connected;
 @property (nonatomic, strong) NSData *lastXfData;      // 最近一次采集到的消费原始数据
+@property (nonatomic, strong) NSData *lastStateData;   // 最近一次读到的设备状态原始数据
 @property (nonatomic, assign) BOOL scanning;
 @property (nonatomic, assign) BOOL busy;
 
@@ -83,6 +86,8 @@ static NSString *RespStateName(KRSyncResponseState s) {
 - (void)parseConsumption:(NSData *)d;
 - (void)onClearConsumption;
 - (void)doClearConsumption;
+- (void)onTryTransaction;
+- (void)onStopTransaction;
 
 @end
 
@@ -131,6 +136,8 @@ static NSString *RespStateName(KRSyncResponseState s) {
     self.probeBtn = [self makeButton:@"探测" action:@selector(onProbe)];
     self.cmdBtn   = [self makeButton:@"指令" action:@selector(onCustomCommand)];
     self.clearBtn = [self makeButton:@"清消费" action:@selector(onClearConsumption)];
+    self.tradeBtn = [self makeButton:@"试交易" action:@selector(onTryTransaction)];
+    self.stopBtn  = [self makeButton:@"停交易" action:@selector(onStopTransaction)];
 
     UIButton *copyBtn  = [self makeButton:@"复制" action:@selector(onCopy)];
     UIButton *resetBtn = [self makeButton:@"清空" action:@selector(onClear)];
@@ -138,12 +145,20 @@ static NSString *RespStateName(KRSyncResponseState s) {
     self.probeBtn.enabled = NO;
     self.cmdBtn.enabled = NO;
     self.clearBtn.enabled = NO;
+    self.tradeBtn.enabled = NO;
+    self.stopBtn.enabled = NO;
+
+    // 有风险的写操作按钮标红
+    self.tradeBtn.tintColor = [UIColor systemRedColor];
+    self.stopBtn.tintColor = [UIColor systemRedColor];
 
     UIStackView *row1 = [[UIStackView alloc] initWithArrangedSubviews:
                          @[self.scanBtn, self.probeBtn, self.cmdBtn]];
     UIStackView *row2 = [[UIStackView alloc] initWithArrangedSubviews:
-                         @[self.clearBtn, copyBtn, resetBtn]];
-    for (UIStackView *r in @[row1, row2]) {
+                         @[self.clearBtn, self.tradeBtn, self.stopBtn]];
+    UIStackView *row3 = [[UIStackView alloc] initWithArrangedSubviews:
+                         @[copyBtn, resetBtn]];
+    for (UIStackView *r in @[row1, row2, row3]) {
         r.translatesAutoresizingMaskIntoConstraints = NO;
         r.axis = UILayoutConstraintAxisHorizontal;
         r.distribution = UIStackViewDistributionFillEqually;
@@ -170,7 +185,12 @@ static NSString *RespStateName(KRSyncResponseState s) {
         [row2.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [row2.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [row2.heightAnchor constraintEqualToConstant:40],
-        [row2.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8],
+
+        [row3.topAnchor constraintEqualToAnchor:row2.bottomAnchor constant:8],
+        [row3.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+        [row3.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+        [row3.heightAnchor constraintEqualToConstant:40],
+        [row3.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8],
     ]];
 }
 
@@ -204,6 +224,7 @@ static NSString *RespStateName(KRSyncResponseState s) {
                      p.name ?: @"(无名)", [p formattedMacAddress] ?: @"?"]];
             ws.probeBtn.enabled = YES;
             ws.cmdBtn.enabled = YES;
+            ws.stopBtn.enabled = YES;   // 紧急停止随时可用
         });
     };
 
@@ -221,6 +242,9 @@ static NSString *RespStateName(KRSyncResponseState s) {
             [ws setStatus:@"已断开" color:[UIColor systemOrangeColor]];
             ws.probeBtn.enabled = NO;
             ws.cmdBtn.enabled = NO;
+            ws.clearBtn.enabled = NO;
+            ws.tradeBtn.enabled = NO;
+            ws.stopBtn.enabled = NO;
         });
     };
 }
@@ -309,7 +333,12 @@ static NSString *RespStateName(KRSyncResponseState s) {
     [self log:@"[1/4] 读取设备状态 krGetStateOfDevice"];
     __weak typeof(self) ws = self;
     [[KRWMCore sharedCore] krGetStateOfDevice:^(KRSyncType t, NSData *d, NSString *orig) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [ws dumpRaw:@"设备状态" data:d original:orig]; });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ws.lastStateData = d;
+            ws.tradeBtn.enabled = YES;
+            [ws dumpRaw:@"设备状态" data:d original:orig];
+            [ws parseState:d];
+        });
     } result:^(KRSyncType t, KRSyncResponseState s) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [ws log:[NSString stringWithFormat:@"    → 结果: %@", RespStateName(s)]];
@@ -456,6 +485,80 @@ static NSString *RespStateName(KRSyncResponseState s) {
                 [ws log:[NSString stringWithFormat:@"    → 结果: %@ (%@)", RespStateName(s), SyncTypeName(t)]];
                 [ws dumpSDKLog];
                 [ws log:@"下一步：再点一次「探测」，看设备是否已回到空闲状态。"];
+                ws.busy = NO;
+            });
+        }];
+}
+
+#pragma mark - 试探交易（写操作，有风险）
+
+- (void)onTryTransaction {
+    if (self.busy) { [self log:@"⚠️ 上一次操作还没结束"]; return; }
+    if (!self.connected) { [self log:@"⚠️ 请先连接设备"]; return; }
+    if (self.lastStateData.length == 0) { [self log:@"⚠️ 请先点「探测」读到设备状态"]; return; }
+
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"试探「开始交易」 funCode=0x31"
+        message:[NSString stringWithFormat:
+                 @"默认把读到的「设备状态」原文当作 payload 发送：\n\n%@\n\n"
+                 @"⚠️ 若成功，设备会开始放水并计费。可随时点「停交易」。\n"
+                 @"想换其它 payload 请用「指令」按钮手动发。",
+                 [KRWMUtils bytesStringWithData:self.lastStateData]]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"发送" style:UIAlertActionStyleDestructive
+                                          handler:^(UIAlertAction *a) { [ws doTryTransaction]; }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)doTryTransaction {
+    self.busy = YES;
+    [self log:@""];
+    [self log:@"===== 试探开始交易 krTransactionRateForDetails (0x31) ====="];
+    [self log:[NSString stringWithFormat:@"发送 payload = %@", [KRWMUtils bytesStringWithData:self.lastStateData]]];
+
+    __weak typeof(self) ws = self;
+    [[KRWMCore sharedCore] krTransactionRateForDetails:self.lastStateData
+        dataCallback:^(KRSyncType t, NSData *d, NSString *orig) {
+            dispatch_async(dispatch_get_main_queue(), ^{ [ws dumpRaw:@"交易响应" data:d original:orig]; });
+        } result:^(KRSyncType t, KRSyncResponseState s) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [ws log:[NSString stringWithFormat:@"    → 结果: %@ (%@)", RespStateName(s), SyncTypeName(t)]];
+                [ws dumpSDKLog];
+                ws.busy = NO;
+            });
+        }];
+}
+
+- (void)onStopTransaction {
+    if (self.busy) { [self log:@"⚠️ 上一次操作还没结束"]; return; }
+    if (!self.connected) { [self log:@"⚠️ 请先连接设备"]; return; }
+
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"结束交易 funCode=0x32"
+        message:@"向设备发送结束交易指令，停止放水。"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"发送" style:UIAlertActionStyleDestructive
+                                          handler:^(UIAlertAction *a) { [ws doStopTransaction]; }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)doStopTransaction {
+    self.busy = YES;
+    [self log:@""];
+    [self log:@"===== 结束交易 krEndTransactionMAXType (0x32) ====="];
+
+    __weak typeof(self) ws = self;
+    [[KRWMCore sharedCore] krEndTransactionMAXType:@(0) MINType:@(1)
+        dataCallback:^(KRSyncType t, NSData *d, NSString *orig) {
+            dispatch_async(dispatch_get_main_queue(), ^{ [ws dumpRaw:@"结束响应" data:d original:orig]; });
+        } result:^(KRSyncType t, KRSyncResponseState s) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [ws log:[NSString stringWithFormat:@"    → 结果: %@ (%@)", RespStateName(s), SyncTypeName(t)]];
+                [ws dumpSDKLog];
                 ws.busy = NO;
             });
         }];
