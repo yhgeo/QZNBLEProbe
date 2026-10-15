@@ -138,6 +138,13 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
 /// 本轮开阀已尝试补结算的次数，防止「补结算 → 仍非空闲 → 再补结算」死循环
 @property (nonatomic, assign) NSInteger settleAttempts;
 
+/// 自动采样（tac）：循环执行「开阀→关水→结算」完整真实交易，积累（记录, tac）样本对。
+/// 每一轮都走正规流程并真实计费，不构造、不修改任何协议数据。
+@property (nonatomic, assign) BOOL autoSampleActive;      // 采样进行中
+@property (nonatomic, assign) NSInteger autoSampleTotal;   // 总轮数
+@property (nonatomic, assign) NSInteger autoSampleDone;    // 已完成轮数
+@property (nonatomic, assign) NSUInteger autoSampleGeneration; // 递增以作废已排程的自动关水
+
 /// 关阀后重连成功时要接着跑的动作
 @property (nonatomic, copy) void (^pendingReconnectBlock)(void);
 
@@ -641,6 +648,8 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
                     ws.startedAt = [NSDate date].timeIntervalSince1970;
                     [ws startTimer];
                     [ws refreshActionButton];
+                    // 自动采样模式：本轮开阀后定时自动关水
+                    if (ws.autoSampleActive) { [ws scheduleAutoStop]; }
                 } else {
                     // 命令发出去了但没确认——不能当失败，费率包可能已经写进去了
                     [ws fail:@"未能确认设备已开启，请确认水流状态后再决定是否重试"];
@@ -779,11 +788,15 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
             dispatch_async(dispatch_get_main_queue(), ^{
                 [ws log:[NSString stringWithFormat:@"写回响应：%@", [KRWMCrypto hexFromData:d]]];
             });
-        } result:^(KRSyncType t, KRSyncResponseState s) {
+        }         result:^(KRSyncType t, KRSyncResponseState s) {
             dispatch_async(dispatch_get_main_queue(), ^{
+                // 只有「写回被确认」才算完整成功，才允许自动采样继续下一轮；
+                // 若记录未清，下一轮读状态会走补结算分支兜底，但采样在这里先停，
+                // 避免在设备状态异常时继续打交易
                 [ws finishWithMessage:(s == KRSyncResponseStateSuccess
                                        ? @"✅ 结算完成，设备已恢复空闲"
-                                       : @"结算完成（设备记录未清，下次连接会自动结清）")];
+                                       : @"结算完成（设备记录未清，下次连接会自动结清）")
+                         autoContinue:(s == KRSyncResponseStateSuccess)];
             });
         }];
 }
@@ -873,12 +886,22 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
     self.startedAt = 0;
     [self.timer invalidate];
     self.timer = nil;
+    // 任何失败都终止自动采样：宁可少采，不在异常状态下继续打交易
+    if (self.autoSampleActive) {
+        self.autoSampleActive = NO;
+        [self log:@"🧪 自动采样已中止（流程出错）"];
+    }
     [self log:[NSString stringWithFormat:@"❌ %@", message]];
     [self refreshActionButton];
     [self updateInfoLabel];
 }
 
 - (void)finishWithMessage:(NSString *)message {
+    [self finishWithMessage:message autoContinue:NO];
+}
+
+/// cont=YES 表示本轮完整成功，允许自动采样继续下一轮
+- (void)finishWithMessage:(NSString *)message autoContinue:(BOOL)cont {
     self.busy = NO;
     self.startedAt = 0;
     [self.timer invalidate];
@@ -889,11 +912,104 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
     [self refreshActionButton];
     [self updateInfoLabel];
 
+    if (self.autoSampleActive) {
+        if (cont) {
+            self.autoSampleDone += 1;
+            if (self.autoSampleDone >= self.autoSampleTotal) {
+                self.autoSampleActive = NO;
+                [self log:[NSString stringWithFormat:@"🧪 自动采样完成：共 %ld 轮样本（日志里搜 xfData=）",
+                           (long)self.autoSampleTotal]];
+            } else {
+                [self log:[NSString stringWithFormat:@"🧪 第 %ld/%ld 轮完成，冷却 5 秒后继续…",
+                           (long)self.autoSampleDone, (long)self.autoSampleTotal]];
+                __weak typeof(self) ws = self;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (!ws.autoSampleActive) return;
+                    [ws startWater];
+                });
+                return;   // 采样期间保持连接，不释放设备
+            }
+        } else {
+            self.autoSampleActive = NO;
+            [self log:@"🧪 自动采样已中止（本轮未完整成功）"];
+        }
+    }
+
     // 结算完主动断开：这是公共设备，用完要让给别人连
     if (self.connected) {
         [self log:@"已断开连接，把设备让给其他人使用。"];
         [[KRWMCore sharedCore] disconnect];
     }
+}
+
+#pragma mark - 自动采样（tac 样本）
+
+/// 循环执行「开阀→关水→结算」完整真实交易。
+/// 边界：每轮都是服务端下单、真实计费、真实出水，只加速"正常使用"的频率，
+/// 不构造/修改任何协议数据。开阀时长随机化是为了让记录字段尽量多样——
+/// 全是几秒的快开快关，记录几乎相同，离线分析拿不到独立方程。
+- (void)onAutoSample {
+    if (self.busy) { [self log:@"⚠️ 正在处理中，请稍候"]; return; }
+    if (!self.connected) { [self log:@"⚠️ 请先扫描并连接设备"]; return; }
+    if (self.startedAt > 0) { [self log:@"⚠️ 请先结束当前用水"]; return; }
+
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"自动采样"
+        message:@"循环执行「开阀→关水→结算」，每轮都是一笔真实计费的完整交易"
+                "（开阀时长随机 5-30 秒，约 0.1-0.5 元/轮）。\n\n"
+                "建议在没人用水的时段进行；轮数越大越容易被服务端风控注意，请自行权衡。"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"轮数（1-30）";
+        tf.text = @"10";
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"开始" style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *a) {
+            NSInteger n = [ac.textFields.firstObject.text integerValue];
+            if (n < 1) n = 1;
+            if (n > 30) n = 30;
+            [ws beginAutoSample:n];
+        }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)beginAutoSample:(NSInteger)n {
+    self.autoSampleActive = YES;
+    self.autoSampleTotal = n;
+    self.autoSampleDone = 0;
+    self.autoSampleGeneration += 1;
+    [self log:@""];
+    [self log:[NSString stringWithFormat:@"🧪 自动采样开始：共 %ld 轮（中途可在「设置」里中止）", (long)n]];
+    [self startWater];
+}
+
+- (void)cancelAutoSample {
+    if (!self.autoSampleActive) return;
+    self.autoSampleActive = NO;
+    self.autoSampleGeneration += 1;   // 作废已排程的自动关水
+    [self log:@"⏹ 自动采样：不再继续后续轮次"];
+    if (self.startedAt > 0 && !self.busy) {
+        [self log:@"正在关水并结清当前轮…"];
+        [self stopWater];
+    }
+}
+
+/// 开阀成功后定时自动关水（不弹确认框）
+- (void)scheduleAutoStop {
+    NSUInteger gen = self.autoSampleGeneration;
+    NSInteger secs = 5 + arc4random_uniform(26);   // 5-30 秒
+    [self log:[NSString stringWithFormat:@"🧪 采样轮：%ld 秒后自动关水（第 %ld/%ld 轮）",
+               (long)secs, (long)self.autoSampleDone + 1, (long)self.autoSampleTotal]];
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(secs * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (gen != ws.autoSampleGeneration) return;    // 已被中止
+        if (ws.busy || ws.startedAt <= 0) return;      // 用户已手动操作
+        [ws stopWater];
+    });
 }
 
 #pragma mark - 设置 / 钱包入口
@@ -903,6 +1019,13 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
                                                                message:nil
                                                         preferredStyle:UIAlertControllerStyleActionSheet];
     __weak typeof(self) ws = self;
+    if (self.autoSampleActive) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"停止自动采样（结清当前轮）" style:UIAlertActionStyleDestructive
+                                              handler:^(UIAlertAction *a) { [ws cancelAutoSample]; }]];
+    } else {
+        [ac addAction:[UIAlertAction actionWithTitle:@"自动采样（tac 样本）" style:UIAlertActionStyleDefault
+                                              handler:^(UIAlertAction *a) { [ws onAutoSample]; }]];
+    }
     [ac addAction:[UIAlertAction actionWithTitle:@"探针（调试）" style:UIAlertActionStyleDefault
                                           handler:^(UIAlertAction *a) { [ws onProbe]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"退出登录" style:UIAlertActionStyleDestructive
