@@ -47,16 +47,27 @@
 - 实测功能码：`0x85` = 读消费详情，`0x18` = 读设备类型
 - 设备响应帧的 control 固定为 `0x81`，发送帧为 `0x80`
 
-### 功能码表（真机实测 + 反汇编交叉验证）
+### 功能码表（反汇编全量提取，关键项经真机验证）
 
-| funCode | 操作 | 验证方式 |
+| funCode | 操作 | SDK 方法 |
 |---|---|---|
-| `0x18` | 读设备类型 | 真机 |
-| `0x23` | 读设备状态 | 真机 + 反汇编（`krGetStateOfDevice` 内 `movz w3,#0x23`） |
-| `0x31` | **开始交易（放水）** | 反汇编（`krTransactionRateForDetails` 内 `movz w3,#0x31`） |
-| `0x32` | **结束交易** | 反汇编（`krEndTransactionMAXType` 内 `movz w3,#0x32`） |
-| `0x85` | 读消费详情 | 真机 |
-| `0x86` | 清除消费数据 | 真机 |
+| `0x17` | 设置密钥（1.1 协议） | `krV1_1SetKeyData:` |
+| `0x18` | 读设备类型 | `krReadingDeviceDataType:MAXType:MINType:` |
+| `0x19` | 清除设备项目信息 | `krClearNumOfDevice:` |
+| `0x20` | 下发项目编号 | `krAssignNumForDevice:productId:` |
+| `0x22` | 结束用水 | `KrStopUsingWater:` |
+| `0x23` | 读设备状态 | `krGetStateOfDevice:` |
+| **`0x31`** | **开始交易（放水）** | `krTransactionRateForDetails:` |
+| **`0x32`** | **结束交易** | `krEndTransactionMAXType:MINType:` |
+| `0x85` | 读消费详情 | `krGetConsumptionDetails:` |
+| `0x86` | 清除消费数据 | `krClearConsumptionDetails:` |
+| `0x88` | 禁用密钥 | `krDisableKeyNo:type:` |
+| `0xC0` | 读冷水表状态 | `krColdWaterMeterGetStateOfDevice:` |
+
+`krAssginRateForDevice:commMode:`（下发费率）与 `krPublicSendData:funCode:`
+的功能码由参数动态传入，不是固定值。
+
+发送帧 `control = 0x80`，设备响应帧 `control = 0x81`（bit0 为响应标志）。
 
 ### 已确认的重要行为
 

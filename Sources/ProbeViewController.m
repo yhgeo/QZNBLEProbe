@@ -12,6 +12,8 @@
 
 #pragma mark - 枚举名映射
 
+// 保留备用（当前报告不输出同步类型，加属性避免未使用告警）
+static NSString *SyncTypeName(KRSyncType t) __attribute__((unused));
 static NSString *SyncTypeName(KRSyncType t) {
     switch (t) {
         case KRSyncTypeUnknown:                        return @"Unknown";
@@ -73,6 +75,7 @@ static NSString *RespStateName(KRSyncResponseState s) {
 @property (nonatomic, strong) UIButton *stopBtn;
 
 @property (nonatomic, strong) NSMutableString *log;
+@property (nonatomic, strong) NSMutableArray<NSString *> *report;   // 只存有效信息，供「复制」输出
 @property (nonatomic, strong) NSMutableArray<CBPeripheral *> *found;
 @property (nonatomic, strong) CBPeripheral *connected;
 @property (nonatomic, strong) NSData *lastXfData;      // 最近一次采集到的消费原始数据
@@ -99,6 +102,7 @@ static NSString *RespStateName(KRSyncResponseState s) {
     [super viewDidLoad];
     self.title = @"热水探测";
     self.log = [NSMutableString string];
+    self.report = [NSMutableArray array];
     self.found = [NSMutableArray array];
 
     self.view.backgroundColor = [UIColor systemBackgroundColor];
@@ -220,8 +224,8 @@ static NSString *RespStateName(KRSyncResponseState s) {
             [ws setStatus:[NSString stringWithFormat:@"✅ 已连接\n%@  %@",
                            p.name ?: @"(无名)", [p formattedMacAddress] ?: @"?"]
                     color:[UIColor systemGreenColor]];
-            [ws log:[NSString stringWithFormat:@"✅ 连接成功: %@  MAC=%@",
-                     p.name ?: @"(无名)", [p formattedMacAddress] ?: @"?"]];
+            [ws report:[NSString stringWithFormat:@"设备: %@  MAC=%@",
+                        p.name ?: @"(无名)", [p formattedMacAddress] ?: @"?"]];
             ws.probeBtn.enabled = YES;
             ws.cmdBtn.enabled = YES;
             ws.stopBtn.enabled = YES;   // 紧急停止随时可用
@@ -329,8 +333,8 @@ static NSString *RespStateName(KRSyncResponseState s) {
 }
 
 - (void)step1_DeviceState {
-    [self log:@""];
-    [self log:@"[1/4] 读取设备状态 krGetStateOfDevice"];
+    [self report:@""];
+    [self report:@"--- [1] 读设备状态 (funCode 0x23) ---"];
     __weak typeof(self) ws = self;
     [[KRWMCore sharedCore] krGetStateOfDevice:^(KRSyncType t, NSData *d, NSString *orig) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -341,15 +345,15 @@ static NSString *RespStateName(KRSyncResponseState s) {
         });
     } result:^(KRSyncType t, KRSyncResponseState s) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            [ws log:[NSString stringWithFormat:@"    → 结果: %@", RespStateName(s)]];
+            [ws report:[NSString stringWithFormat:@"结果: %@", RespStateName(s)]];
             [ws step2_Consumption];
         });
     }];
 }
 
 - (void)step2_Consumption {
-    [self log:@""];
-    [self log:@"[2/4] 读取消费详情 krGetConsumptionDetails"];
+    [self report:@""];
+    [self report:@"--- [2] 读消费详情 (funCode 0x85) ---"];
     __weak typeof(self) ws = self;
     [[KRWMCore sharedCore] krGetConsumptionDetails:^(KRSyncType t, NSData *d, NSString *orig) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -358,15 +362,15 @@ static NSString *RespStateName(KRSyncResponseState s) {
         });
     } result:^(KRSyncType t, KRSyncResponseState s) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            [ws log:[NSString stringWithFormat:@"    → 结果: %@", RespStateName(s)]];
+            [ws report:[NSString stringWithFormat:@"结果: %@", RespStateName(s)]];
             [ws step3_ColdWater];
         });
     }];
 }
 
 - (void)step3_ColdWater {
-    [self log:@""];
-    [self log:@"[3/4] 读取冷水表信息 krColdWaterMeterGetStateOfDevice"];
+    [self report:@""];
+    [self report:@"--- [3] 读冷水表信息 (funCode 0xC0) ---"];
     __weak typeof(self) ws = self;
     [[KRWMCore sharedCore] krColdWaterMeterGetStateOfDevice:^(KRSyncType t, NSData *d, NSString *orig) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -375,25 +379,24 @@ static NSString *RespStateName(KRSyncResponseState s) {
         });
     } result:^(KRSyncType t, KRSyncResponseState s) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            [ws log:[NSString stringWithFormat:@"    → 结果: %@", RespStateName(s)]];
+            [ws report:[NSString stringWithFormat:@"结果: %@", RespStateName(s)]];
             [ws step4_DeviceType];
         });
     }];
 }
 
 - (void)step4_DeviceType {
-    [self log:@""];
-    [self log:@"[4/4] 读取设备类型 krReadingDeviceDataType (读模式)"];
+    [self report:@""];
+    [self report:@"--- [4] 读设备类型 (funCode 0x18) ---"];
     __weak typeof(self) ws = self;
     [[KRWMCore sharedCore] krReadingDeviceDataType:@(0) MAXType:@(0) MINType:@(0)
         dataCallback:^(KRSyncType t, NSData *d, NSString *orig) {
             dispatch_async(dispatch_get_main_queue(), ^{ [ws dumpRaw:@"设备类型" data:d original:orig]; });
         } result:^(KRSyncType t, KRSyncResponseState s) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [ws log:[NSString stringWithFormat:@"    → 结果: %@", RespStateName(s)]];
-                [ws log:@""];
-                [ws log:@"========== 探测结束 =========="];
-                [ws dumpSDKLog];
+                [ws report:[NSString stringWithFormat:@"结果: %@", RespStateName(s)]];
+                [ws report:@""];
+                [ws report:@"=== 探测结束 ==="];
                 ws.busy = NO;
                 ws.probeBtn.enabled = YES;
             });
@@ -434,9 +437,10 @@ static NSString *RespStateName(KRSyncResponseState s) {
         payload = [KRWMUtils convertHexStrToData:parts[1]];
     }
 
-    [self log:@""];
-    [self log:[NSString stringWithFormat:@"→ 发送 funCode=0x%02X payload=%@",
-               funCode, payload.length ? [KRWMUtils bytesStringWithData:payload] : @"(空)"]];
+    [self report:@""];
+    [self report:[NSString stringWithFormat:@"--- 自定义指令 funCode=0x%02X ---", funCode]];
+    [self report:[NSString stringWithFormat:@"发送 payload: %@",
+                  payload.length ? [KRWMUtils bytesStringWithData:payload] : @"(空)"]];
 
     __weak typeof(self) ws = self;
     [[KRWMCore sharedCore] krPublicSendData:payload funCode:funCode
@@ -444,7 +448,7 @@ static NSString *RespStateName(KRSyncResponseState s) {
             dispatch_async(dispatch_get_main_queue(), ^{ [ws dumpRaw:@"响应" data:d original:orig]; });
         } result:^(KRSyncType t, KRSyncResponseState s) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [ws log:[NSString stringWithFormat:@"    → 结果: %@ (%@)", RespStateName(s), SyncTypeName(t)]];
+                [ws report:[NSString stringWithFormat:@"结果: %@", RespStateName(s)]];
             });
         }];
 }
@@ -472,9 +476,9 @@ static NSString *RespStateName(KRSyncResponseState s) {
 
 - (void)doClearConsumption {
     self.busy = YES;
-    [self log:@""];
-    [self log:@"===== 清除消费数据 krClearConsumptionDetails ====="];
-    [self log:[NSString stringWithFormat:@"发送 data = %@", [KRWMUtils bytesStringWithData:self.lastXfData]]];
+    [self report:@""];
+    [self report:@"--- 清除消费数据 (funCode 0x86) ---"];
+    [self report:[NSString stringWithFormat:@"发送 payload: %@", [KRWMUtils bytesStringWithData:self.lastXfData]]];
 
     __weak typeof(self) ws = self;
     [[KRWMCore sharedCore] krClearConsumptionDetails:self.lastXfData
@@ -482,9 +486,8 @@ static NSString *RespStateName(KRSyncResponseState s) {
             dispatch_async(dispatch_get_main_queue(), ^{ [ws dumpRaw:@"清除响应" data:d original:orig]; });
         } result:^(KRSyncType t, KRSyncResponseState s) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [ws log:[NSString stringWithFormat:@"    → 结果: %@ (%@)", RespStateName(s), SyncTypeName(t)]];
-                [ws dumpSDKLog];
-                [ws log:@"下一步：再点一次「探测」，看设备是否已回到空闲状态。"];
+                [ws report:[NSString stringWithFormat:@"结果: %@", RespStateName(s)]];
+                [ws report:@"提示: 再点「探测」确认 onCharge 是否变为 0（空闲）"];
                 ws.busy = NO;
             });
         }];
@@ -514,9 +517,9 @@ static NSString *RespStateName(KRSyncResponseState s) {
 
 - (void)doTryTransaction {
     self.busy = YES;
-    [self log:@""];
-    [self log:@"===== 试探开始交易 krTransactionRateForDetails (0x31) ====="];
-    [self log:[NSString stringWithFormat:@"发送 payload = %@", [KRWMUtils bytesStringWithData:self.lastStateData]]];
+    [self report:@""];
+    [self report:@"--- 试探开始交易 (funCode 0x31) ---"];
+    [self report:[NSString stringWithFormat:@"发送 payload: %@", [KRWMUtils bytesStringWithData:self.lastStateData]]];
 
     __weak typeof(self) ws = self;
     [[KRWMCore sharedCore] krTransactionRateForDetails:self.lastStateData
@@ -524,8 +527,7 @@ static NSString *RespStateName(KRSyncResponseState s) {
             dispatch_async(dispatch_get_main_queue(), ^{ [ws dumpRaw:@"交易响应" data:d original:orig]; });
         } result:^(KRSyncType t, KRSyncResponseState s) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [ws log:[NSString stringWithFormat:@"    → 结果: %@ (%@)", RespStateName(s), SyncTypeName(t)]];
-                [ws dumpSDKLog];
+                [ws report:[NSString stringWithFormat:@"结果: %@", RespStateName(s)]];
                 ws.busy = NO;
             });
         }];
@@ -548,8 +550,8 @@ static NSString *RespStateName(KRSyncResponseState s) {
 
 - (void)doStopTransaction {
     self.busy = YES;
-    [self log:@""];
-    [self log:@"===== 结束交易 krEndTransactionMAXType (0x32) ====="];
+    [self report:@""];
+    [self report:@"--- 结束交易 (funCode 0x32) ---"];
 
     __weak typeof(self) ws = self;
     [[KRWMCore sharedCore] krEndTransactionMAXType:@(0) MINType:@(1)
@@ -557,8 +559,7 @@ static NSString *RespStateName(KRSyncResponseState s) {
             dispatch_async(dispatch_get_main_queue(), ^{ [ws dumpRaw:@"结束响应" data:d original:orig]; });
         } result:^(KRSyncType t, KRSyncResponseState s) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [ws log:[NSString stringWithFormat:@"    → 结果: %@ (%@)", RespStateName(s), SyncTypeName(t)]];
-                [ws dumpSDKLog];
+                [ws report:[NSString stringWithFormat:@"结果: %@", RespStateName(s)]];
                 ws.busy = NO;
             });
         }];
@@ -581,53 +582,43 @@ static NSString *RespStateName(KRSyncResponseState s) {
 #pragma mark - 报文解析
 
 - (void)dumpRaw:(NSString *)tag data:(NSData *)d original:(NSString *)orig {
-    if (!d) { [self log:[NSString stringWithFormat:@"    → %@: (无数据)", tag]]; return; }
-    [self log:[NSString stringWithFormat:@"    → %@ 长度=%lu", tag, (unsigned long)d.length]];
-    [self log:[NSString stringWithFormat:@"    → %@ HEX: %@", tag, [KRWMUtils bytesStringWithData:d]]];
+    if (!d) { [self report:[NSString stringWithFormat:@"%@: (无数据)", tag]]; return; }
+    [self report:[NSString stringWithFormat:@"%@ payload(%luB): %@",
+                  tag, (unsigned long)d.length, [KRWMUtils bytesStringWithData:d]]];
     if (orig.length > 0) {
-        [self log:[NSString stringWithFormat:@"    → %@ 原文: %@", tag, orig]];
+        [self report:[NSString stringWithFormat:@"%@ 原始帧: %@", tag, orig]];
     }
 }
 
 - (void)parseState:(NSData *)d {
     KRStateObject *st = [KRStateObject stateObjectWithDetailsFromData:d];
-    if (!st) { [self log:@"      (状态解析失败)" ]; return; }
-    [self log:@"      --- 状态字段 ---"];
-    [self log:[NSString stringWithFormat:@"      productId(项目编号) = %@", st.productId]];
-    [self log:[NSString stringWithFormat:@"      deviceId(设备ID)   = %@", st.deviceId]];
-    [self log:[NSString stringWithFormat:@"      accountId(账号)    = %@", st.accountId]];
-    [self log:[NSString stringWithFormat:@"      macAddress         = %@", st.macAddress]];
-    [self log:[NSString stringWithFormat:@"      onCharge           = %@  (0空闲/1有订单/2刷卡/3待采集)", st.onCharge]];
-    [self log:[NSString stringWithFormat:@"      status(故障)       = %@", st.status]];
-    [self log:[NSString stringWithFormat:@"      ★ tacTimes(交易随机数) = %@", st.tacTimes]];
-    [self log:[NSString stringWithFormat:@"      maxType=%@ minType=%@ macType=%@", st.maxType, st.minType, st.macType]];
-    [self log:[NSString stringWithFormat:@"      chargeMethod(计费) = %@", st.chargeMethod]];
-    [self log:[NSString stringWithFormat:@"      macTime            = %@ 分钟", st.macTime]];
-    [self log:[NSString stringWithFormat:@"      verSoft=%@ commMode=%@", st.verSoft, st.commMode]];
-    [self log:[NSString stringWithFormat:@"      cardmoney          = %@ 厘", st.cardmoney]];
-    [self log:[NSString stringWithFormat:@"      KEYNO=%@ functionType=%@", st.KEYNO, st.functionType]];
-    [self log:[NSString stringWithFormat:@"      reserved           = %@", [KRWMUtils bytesStringWithData:st.reserved]]];
+    if (!st) { [self report:@"(状态解析失败)"]; return; }
+    [self report:[NSString stringWithFormat:@"productId=%@  deviceId=%@  accountId=%@  mac=%@",
+                  st.productId, st.deviceId, st.accountId, st.macAddress]];
+    [self report:[NSString stringWithFormat:@"onCharge=%@ (0空闲/1有订单/2刷卡/3待采集)  status=%@  tacTimes=%@",
+                  st.onCharge, st.status, st.tacTimes]];
+    [self report:[NSString stringWithFormat:@"maxType=%@  minType=%@  macType=%@  chargeMethod=%@  macTime=%@",
+                  st.maxType, st.minType, st.macType, st.chargeMethod, st.macTime]];
+    [self report:[NSString stringWithFormat:@"verSoft=%@  commMode=%@  cardmoney=%@  KEYNO=%@  functionType=%@",
+                  st.verSoft, st.commMode, st.cardmoney, st.KEYNO, st.functionType]];
+    [self report:[NSString stringWithFormat:@"reserved=%@", [KRWMUtils bytesStringWithData:st.reserved]]];
 }
 
 - (void)parseConsumption:(NSData *)d {
     KRConsumptionDetailsObject *cd = [KRConsumptionDetailsObject consumptionDetailsObjectWithDetailsFromData:d];
-    if (!cd) { [self log:@"      (消费详情解析失败)"]; return; }
+    if (!cd) { [self report:@"(消费详情解析失败)"]; return; }
 
     // 保存原始消费数据，供「清消费」回传给设备
     self.lastXfData = cd.xfData;
     self.clearBtn.enabled = (cd.xfData.length > 0);
 
-    [self log:@"      --- 消费字段 ---"];
-    [self log:[NSString stringWithFormat:@"      ★ rate(费率)       = %@   ← 关键！", cd.rate]];
-    [self log:[NSString stringWithFormat:@"      ykMoney(预扣)      = %@ 厘", cd.ykMoney]];
-    [self log:[NSString stringWithFormat:@"      consumeMone(消费)  = %@ 厘", cd.consumeMone]];
-    [self log:[NSString stringWithFormat:@"      accountId=%@ accountType=%@ useCount=%@", cd.accountId, cd.accountType, cd.useCount]];
-    [self log:[NSString stringWithFormat:@"      timeId=%@ productId=%@ deviceId=%@", cd.timeId, cd.productId, cd.deviceId]];
-    [self log:[NSString stringWithFormat:@"      useTime=%@秒 flowRate=%@mL/6s pluseNum=%@", cd.useTime, cd.flowRate, cd.pluseNum]];
-    [self log:[NSString stringWithFormat:@"      waterTemp=%@℃ totalCapacity=%@L pauseCnt=%@", cd.waterTemp, cd.totalCapacity, cd.pauseCnt]];
-    [self log:[NSString stringWithFormat:@"      macAddress=%@", cd.macAddress]];
-    [self log:[NSString stringWithFormat:@"      ★ tac=%@ keyNo=%@", cd.tac, cd.keyNo]];
-    [self log:[NSString stringWithFormat:@"      xfData=%@", [KRWMUtils bytesStringWithData:cd.xfData]]];
+    [self report:[NSString stringWithFormat:@"rate(费率)=%@  ykMoney(预扣)=%@厘  consumeMone(消费)=%@厘",
+                  cd.rate, cd.ykMoney, cd.consumeMone]];
+    [self report:[NSString stringWithFormat:@"accountId=%@  accountType=%@  useCount=%@  timeId=%@",
+                  cd.accountId, cd.accountType, cd.useCount, cd.timeId]];
+    [self report:[NSString stringWithFormat:@"useTime=%@  flowRate=%@  waterTemp=%@  totalCapacity=%@  pauseCnt=%@",
+                  cd.useTime, cd.flowRate, cd.waterTemp, cd.totalCapacity, cd.pauseCnt]];
+    [self report:[NSString stringWithFormat:@"tac=%@  keyNo=%@", cd.tac, cd.keyNo]];
 }
 
 #pragma mark - 日志与工具
@@ -646,20 +637,52 @@ static NSString *RespStateName(KRSyncResponseState s) {
     [self.logView scrollRangeToVisible:bottom];
 }
 
+// 记录「有效信息」：既显示在屏幕，也进入可复制的报告
+- (void)report:(NSString *)text {
+    if (![NSThread isMainThread]) {
+        __weak typeof(self) ws = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [ws report:text]; });
+        return;
+    }
+    if (text == nil) text = @"";
+    [self.report addObject:text];
+    [self log:text];
+}
+
+- (NSString *)timestamp {
+    static NSDateFormatter *fmt = nil;
+    if (!fmt) {
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    }
+    return [fmt stringFromDate:[NSDate date]];
+}
+
 - (void)setStatus:(NSString *)text color:(UIColor *)color {
     self.statusLabel.text = text;
     self.statusLabel.textColor = color;
 }
 
 - (void)onCopy {
-    if (self.log.length == 0) return;
-    [UIPasteboard generalPasteboard].string = self.log;
-    [self log:@"📋 日志已复制到剪贴板"];
+    if (self.report.count == 0) {
+        [self log:@"⚠️ 还没有有效信息可复制（请先连接设备并操作）"];
+        return;
+    }
+    NSString *body = [self.report componentsJoinedByString:@"\n"];
+    NSString *out = [NSString stringWithFormat:
+                     @"=== QZNOSDK 探针报告 ===\n"
+                     @"时间: %@\n"
+                     @"(已滤除扫描列表等噪音，仅保留有效信息)\n\n%@\n",
+                     [self timestamp], body];
+    [UIPasteboard generalPasteboard].string = out;
+    [self log:[NSString stringWithFormat:@"📋 已复制 %lu 行有效信息（共 %lu 字符）",
+               (unsigned long)self.report.count, (unsigned long)out.length]];
 }
 
 - (void)onClear {
     [self.log setString:@""];
     self.logView.text = @"";
+    [self.report removeAllObjects];
 }
 
 @end
