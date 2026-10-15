@@ -222,6 +222,9 @@ static NSDictionary *LEDInspectFrame(NSString *orig, unsigned int expectFunCode)
           verdict:(NSString *)verdict
            detail:(NSString *)detail
          evidence:(NSString *)evidence;
+- (void)recordWriteBackResult:(NSString *)detail
+                      verdict:(NSString *)verdict
+                     evidence:(NSString *)evidence;
 @end
 
 /// 用真机实测样本做一次离线自检：确认字段偏移没写错。
@@ -794,6 +797,8 @@ static void LEDSelfTestAgainstRealSample(LEDVerifyRunner *runner) {
         dataCallback:^(KRSyncType t, NSData *d, NSString *orig) {
             [ws log:[NSString stringWithFormat:@"0x86 响应 payload: %@", [KRWMCrypto hexFromData:d]]];
         } result:^(KRSyncType t, KRSyncResponseState s) {
+            // 注意：SDK 的 `KRSyncResponseStateSuccess` 是「写命令已确认」，
+            // 设备对 payload 本身是否买账要看随后的 state 复查。
             BOOL acked = (s == KRSyncResponseStateSuccess);
             [ws log:[NSString stringWithFormat:@"0x86 同步状态: %ld", (long)s]];
             // 紧接着读一次状态：state 还是 3/6 就说明记录没被清（设备侧有完整性校验）
@@ -806,24 +811,48 @@ static void LEDSelfTestAgainstRealSample(LEDVerifyRunner *runner) {
                     NSString *detail = [NSString stringWithFormat:
                         @"回传 xfData 后设备 ACK=%@，state=%u（0 空闲 / 3 待采集）→ %@",
                         acked ? @"是" : @"否", st,
-                        cleared ? @"设备接受了回传并清空" : @"设备没清记录，说明它在校验数据本身（tac/完整性）"];
-                    [ws addResult:@"B5.1" title:@"把 0x85 原样当 0x86 写回，设备是否买账" verdict:cleared ? V_WARN : V_PASS
-                           detail:detail evidence:orig2 ?: @""];
+                        cleared ? @"设备接受了回传并清空（说明设备不校验 payload，谁来都给清）"
+                                : @"设备回了 ACK 但没清记录 → 它校验的是数据本身，而不是「有没有发 0x86」。"
+                                  @"原始 0x85 数据不是合法的 0x86 payload（正解是服务端 clData 解密后那段）"];
+                    [ws recordWriteBackResult:detail verdict:(cleared ? V_WARN : V_PASS) evidence:orig2];
                     if (completion) completion(acked, cleared, detail);
                 } result:^(KRSyncType t2, KRSyncResponseState s2) {
-                    NSString *detail = [NSString stringWithFormat:@"写回 ACK=%@，但复查状态失败（%ld）",
-                                        acked ? @"是" : @"否", (long)s2];
-                    [ws addResult:@"B5.1" title:@"写回后复查状态" verdict:V_SKIP detail:detail evidence:nil];
+                    NSString *detail = [NSString stringWithFormat:
+                        @"写回命令 ACK=%@，但复查状态没读到（同步状态 %ld）——"
+                        @"结论未定，可再跑一次自动验证", acked ? @"是" : @"否", (long)s2];
+                    [ws recordWriteBackResult:detail verdict:V_SKIP evidence:nil];
                     if (completion) completion(acked, NO, detail);
                 }];
             });
         }];
 }
 
+/// B5 结果的唯一写入口。
+///
+/// 之前这里有两条添加路径，导致报告里出现**两条 B5.1**（一条 INFO、一条 SKIP），
+/// 而且 `markdownReport` 用的是旧的 `self.markdown`，会把新结果吞掉。
+/// 现在统一走这里，并**同时刷新** `markdown`，保证复制到的一定是最新报告。
+- (void)recordWriteBackResult:(NSString *)detail
+                      verdict:(NSString *)verdict
+                     evidence:(NSString *)evidence {
+    for (NSInteger i = (NSInteger)self.results.count - 1; i >= 0; i--) {
+        if ([self.results[(NSUInteger)i].ident isEqualToString:@"B5.1"]) {
+            [self.results removeObjectAtIndex:(NSUInteger)i];
+        }
+    }
+    [self addResult:@"B5.1"
+              title:@"把 0x85 原文当 0x86 回传，设备是否买账"
+            verdict:verdict
+             detail:detail
+           evidence:evidence];
+    self.markdown = [self buildReport];
+}
+
 #pragma mark - 报告
 
+/// 报告永远即时重建，避免"复制到旧报告"（B5 之前就踩过这个坑）
 - (NSString *)markdownReport {
-    return self.markdown.length ? self.markdown : [self buildReport];
+    return [self buildReport];
 }
 
 - (NSString *)buildReport {
