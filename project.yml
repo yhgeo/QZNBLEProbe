@@ -4,6 +4,9 @@ options:
   bundleIdPrefix: com.qznprobe
   deploymentTarget:
     iOS: "14.0"
+  # 显式声明目标 Xcode 版本，避免 xcodegen 生成 Xcode 16 的新工程格式(objectVersion 77)，
+  # 导致较旧的 runner 读不了工程文件
+  xcodeVersion: "15.0"
   createIntermediateGroups: true
   generateEmptyDirectories: true
 

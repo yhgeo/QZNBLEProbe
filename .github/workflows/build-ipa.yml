@@ -17,11 +17,24 @@ jobs:
           xcodebuild -version
           xcodebuild -showsdks | grep -i iphoneos || true
 
+      - name: Select newest Xcode available
+        run: |
+          echo "== 已安装的 Xcode =="
+          ls -d /Applications/Xcode*.app || true
+          XC=$(ls -d /Applications/Xcode_1[6-9]*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XC" ]; then XC=$(ls -d /Applications/Xcode*.app | sort -V | tail -1); fi
+          echo "== 选用 $XC =="
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+
       - name: Install xcodegen
         run: brew install xcodegen
 
       - name: Generate Xcode project
-        run: xcodegen generate
+        run: |
+          xcodegen generate
+          echo "== 生成的工程格式 =="
+          grep -m1 objectVersion QZNBLEProbe.xcodeproj/project.pbxproj || true
 
       - name: Build (unsigned)
         run: |
@@ -36,7 +49,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build 2>&1 | tail -60
+            build 2>&1 | tail -80
 
       - name: Package IPA
         run: |
