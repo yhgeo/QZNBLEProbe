@@ -138,4 +138,4 @@ project.yml                   xcodegen 工程描述
 
 `Frameworks/QZNOSDK.framework` 来自
 [zhiquanlo/SDKQZNetworkOffline](https://github.com/zhiquanlo/SDKQZNetworkOffline)，
-MIT License，Copyright (c) 2020 李志权。本仓库仅做研究用途转发，版权归原作者所有。
+MIT License，Copyright (c) 2020 李志权。版权归原作者所有。
