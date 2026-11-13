@@ -55,6 +55,7 @@
     __weak typeof(self) ws = self;
     tick = ^{
         if (ws.stopRequested) {
+            ws.running = NO;
             [ws log:[NSString stringWithFormat:@"✅ 占用结束，共 %ld 次心跳", (long)beats]];
             if (completion) completion(YES, [NSString stringWithFormat:@"心跳 %ld 次", (long)beats]);
             return;
@@ -71,6 +72,7 @@
             beats += 1;
             elapsed += interval;
             if (duration > 0 && elapsed >= duration) {
+                ws.running = NO;
                 [ws log:[NSString stringWithFormat:@"✅ 占用满 %.0fs，共 %ld 次心跳", duration, (long)beats]];
                 if (completion) completion(YES, [NSString stringWithFormat:@"心跳 %ld 次", (long)beats]);
                 return;
@@ -113,6 +115,7 @@
     __weak typeof(self) ws = self;
     round = ^{
         if (ws.stopRequested || n >= rounds) {
+            ws.running = NO;
             [ws log:[NSString stringWithFormat:@"✅ 风暴结束：%ld/%ld 轮成功", (long)ok, (long)rounds]];
             if (completion) completion(ok, rounds);
             return;
@@ -172,6 +175,7 @@
                         }
                     } result:^(KRSyncType t3, KRSyncResponseState s3) {
                         BOOL ok = (s == KRSyncResponseStateSuccess);
+                        self.running = NO;
                         if (completion) completion(ok, [lines componentsJoinedByString:@" / "]);
                     }];
                 });
@@ -237,6 +241,7 @@
                                 }
                             } result:^(KRSyncType t6, KRSyncResponseState s6) {
                                 BOOL ok = (s == KRSyncResponseStateSuccess);
+                                self.running = NO;
                                 if (completion) completion(ok, summary);
                             }];
                         });
