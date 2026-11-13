@@ -7,7 +7,9 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-14 在免费额度下会被解析成 macos-14-arm64-us-default（不支持），
+    # 固定用 Intel 版 macos-13；若仍不可用，改成 macos-15-intel。
+    runs-on: macos-13
     steps:
       - name: Checkout
         uses: actions/checkout@v4
