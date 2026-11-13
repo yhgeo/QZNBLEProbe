@@ -8,9 +8,6 @@
 #import <QZNOSDK/KRWaterMeterKit.h>
 
 static const uint8_t kHead = 0x60;
-static const uint8_t kCmdState   = 0x23;
-static const uint8_t kCmdCollect = 0x85;
-static const uint8_t kCmdWriteBk = 0x86;
 
 static uint32_t KRUR32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
@@ -18,6 +15,7 @@ static uint32_t KRUR32(const uint8_t *p) {
 
 /// 响应帧是 60 … 16 时去掉前 6 字节头，统一按 payload 解析
 static NSData *KRUPayload(NSData *d) {
+    if (d.length == 0) return nil;
     if (d.length >= 8 && ((const uint8_t *)d.bytes)[0] == kHead) {
         NSUInteger declared = ((NSUInteger)((const uint8_t *)d.bytes)[1] << 8)
                             | ((const uint8_t *)d.bytes)[2];
