@@ -400,6 +400,24 @@ raw  = 参与签名的字段按 key 字典序升序拼成 "key1value1key2value2�
    **226**，账单停在 0.0；重连后采集才被接受。（linyu 2026-09-30，订单 97547 对比实测）
 2. **`xfData` 必须小写。** 签名用小写、上传字段也必须小写，否则按收到的值重算签名对不上 → **170**。
 
+### 6.6 台账查询失败的排查顺序（2026-10-28 实测）
+
+`/device/info/mac` 查不到时，App 提示「未查到该设备的台账信息（可能不在本校项目内）」，
+**这句话会掩盖真实原因**：`KRWMClient.tryDeviceInfoVariants` 把网络错误、会话失效、
+空数据统一归成同一句话，从日志看不出根因。
+
+实测时间线：10-24 23:50 仍正常（`deviceId=3613 bigType=4 smallType=1`），
+10-26 23:40 起持续失败，**重新登录后恢复** → 根因是 `loginCode` 过期。
+
+排查顺序：
+
+1. **先怀疑 `loginCode` 过期**——退出重登即可验证，成本最低
+2. 再查网络 / `Config-Project` 头
+3. 最后才怀疑设备不在本项目
+
+⚠️ 蓝牙连接与台账查询是**两条独立链路**：蓝牙能连、能读状态（`0x23` 正常返回），
+台账照样可能查不到。看到「连接正常但用不了」，先定位失败发生在哪一步。
+
 ---
 
 ## 7. 计费链路的安全性
@@ -606,10 +624,12 @@ protocolType, randomNumber, xfData, signature, + auth 字段
 
 - [ ] `state=3/6` 补结算流程的完整真机走查（代码已有）
 - [ ] 状态帧 `a1`（`p[30]`）的语义
-- [ ] 用**两笔金额不同**的用水样本，最终坐实 §4.2 的字段宽度归属
-- [x] 多采 `randomNumber` 样本，刻画其生成规律（→ 已证实为确定性计数器，附录 C.2①）
-- [ ] 被动收集（记录明文, `tac`）样本对，判定 `tac` 是弱校验和还是强 MAC（附录 C.2②；
-      已 13 组，其中标准校验和扫描全灭；**需真实出水的样本**撑开差分空间）
+- [x] 用**两笔金额不同**的用水样本，最终坐实 §4.2 的字段宽度归属
+      （→ 2026-10-28 已得 5 笔真实出水，宽度 4/2/2/1 闭合成立）
+- [x] 多采 `randomNumber` 样本，刻画其生成规律（→ 确定性 16 位小端计数器，附录 C.2①）
+- [ ] 判定 `tac` 是弱校验和还是强 MAC（附录 C.2②）
+      → **标准校验和家族已在 18 组（含 5 笔真实出水）上全灭，CRC 类可排除**
+      → 下一步需 ≥41 组做 GF(2) 线性求解，或验证是否为带密钥 MAC
 
 ---
 
@@ -671,15 +691,14 @@ if (twoComplement[4] == 35) {        // 0x23 查询：请求/响应同码
 
 **① `randomNumber` 弱伪随机（Weak PRNG 类）——已坐实为确定性计数器**
 
-早期 4 个样本：`a7000000`、`b9000000`、`e1000000`、`f7000000`——低 3 字节恒为零。
-**2026-10-16 自动采样 10 轮给出规律**：
+早期 4 个样本：`a7000000`、`b9000000`、`e1000000`、`f7000000`——高 2 字节为零。
+**2026-10-16 自动采样 10 轮 + 2026-10-28 十天日志（15 个读数）联合刻画**：
 
-- 每次开阀成功后低字节推进 **0x26 → 0x2e**，推进量每两轮递增 +2
-  （连续序列 `b1→d7→fd→25→4d→77→a1→cd→f9→27→55`）
-- 低 3 字节**始终为 0**，从未变过
+- 实为 **16 位小端计数器 + 高 2 字节零填充**（⚠️ 早期"低 3 字节恒为零"的说法**已修正**）
+- 10 天序列（小端解出）：`0455→0485→0749→0787→0a25→0a6d→0e77→0ecd→0f25→13f1→1739`
+- 开阀成功后推进几十到一百多；跨天/跨小时推进更大
 - 结算前刷新读到的值与下一轮开阀读到的值**完全一致**（同一状态两次读取相同）
-- 结合跨天样本（间隔数小时推进更大，如 `f7→05→25`），形如
-  「开阀事件跳变 + 时间慢漂移」的计数器，**无真随机成分**
+- 形如「开阀事件跳变 + 时间慢漂移」的计数器，**无真随机成分**
 
 - 理论影响：L2「会话绑定」的熵接近于零，会话值完全可预测
 - 实际影响有限：钱在结算时按用量扣（§9），跳过上传则设备卡死 `state=3`（§7.3）；
@@ -687,14 +706,23 @@ if (twoComplement[4] == 35) {        // 0x23 查询：请求/响应同码
 
 **② `tac` 是唯一符合「自研弱算法 + 已知明文」画像的落点**
 
-5 字节派生值，跑在设备 MCU 上，**大概率不是密码学 MAC，而是 CRC 类校验和**。
-样本进展（2026-10-16）：**13 组**（含自动采样 10 轮）。
+5 字节派生值，跑在设备 MCU 上。
+样本进展（2026-10-28）：**18 组**，其中 **5 笔真实出水**（金额 0.442 / 0.390 / 0.676 / 0.390 / 0.000）。
 
-- 标准校验和家族 × 全区间扫描（13224 组合）在 13 组上**全部无命中**——
-  排除「任意连续区间的标准 CRC32/Adler/Fletcher/和校验」
-- ⚠️ 当前样本局限：10 组为零消费记录，记录间**只有 timeId 在变**——
-  差分空间被限制在 48 bit 内，做全消息线性求解必须要有**真实出水**的样本
-  （让 pluseNum/useTime/consumeMone 散开）
+- 标准校验和家族 × 全区间扫描（13224 组合）**全部无命中**，且在**真实出水样本上同样全灭**
+  → 「任意连续区间的标准 CRC32/Adler/Fletcher/和校验」**已可结案排除**
+- 真实出水样本（`tools/samples_real.txt`）已撑开差分空间：
+
+  | 时间 | 金额 | consumeMone | pluseNum | useTime | tac |
+  |---|---|---|---|---|---|
+  | 10-16 22:51 | 0.442 | 442 | 166 | 428 | `f96406c518` |
+  | 10-19 22:08 | 0.390 | 390 | 149 | 412 | `3892a61860` |
+  | 10-21 22:19 | 0.676 | 676 | 257 | 483 | `34c29fec72` |
+  | 10-21 22:33 | 0.390 | 390 | 145 | 373 | `a8eb41a31a` |
+  | 10-24 23:49 | 0.000 | 0 | 0 | 0 | `b3449270bd` |
+
+- 注意：两笔同为 0.390 元的记录 `tac` **不同** → 它依赖 `timeId` 等记录内容，**不是金额指纹**
+- 剩余可能：带密钥 MAC / 非标准 CRC 变体 / 字段加权组合；需 ≥41 组做 GF(2) 线性求解
 - 即使逆推出结构，也大概率死在 `clData` 写回——设备校验 payload 本身（§11.3）
 
 ### C.3 明确不适用的
@@ -728,3 +756,344 @@ if (twoComplement[4] == 35) {        // 0x23 查询：请求/响应同码
 
 **探针页按钮**：扫描 / 探测 / 指令（发任意 `功能码HEX,payloadHEX`）/ 清消费 /
 试交易 / 停交易 / **自动验证** / 复制报告。
+
+---
+
+## 附录 D：2026-11-13 真机实测修订（PC 直连 + 真实账号结算）
+
+> 环境：Windows / Python 3.13 / bleak 3.1.0，`C4:7F:0E:DB:D1:42`，
+> 账号 `15005036284`（短信验证码登录），`loginCode` 见 `tools/session.json`。
+> 本节结论优先级高于正文对应条目。
+
+### D.1 链路与坐标（正文 §5.4 写反）
+
+| 用途 | 正文 §5.4 | 实测 |
+|---|---|---|
+| 服务 | `FF00` | `0000ff00-…-00805f9b34fb` ✓ |
+| 写 | `FF01` | **`FF02`**（write + write-without-response） |
+| 通知 | `FF02` | **`FF01`**（notify） |
+| 额外 | — | **`FF03`** notify+write、**`FF04`** read+write+notify（read 返回空） |
+
+`FF03` 也参与响应推送（同一帧在 `FF01`/`FF03` 各一片，前有 `\x01\x01` 前缀）。
+写 `FF03`/`FF04`/`FF01` 的 `0x23` 全部无响应，只有 `FF02` 可写。
+
+### D.2 功能码全枚举（248 个空体帧）
+
+只 3 个响应：`0x18`→`800001`（设备类型 主类0/子类1）、`0x23`→48B 状态帧、
+**`0x24`→`80`（正文命令字表没有的新码）**。其余 245 个静默丢弃，不回 `81 04`。
+`0xC0` 本机仅回 `\x01\x01` 无帧。
+
+### D.3 管理命令无鉴权（正文 §7.5 结论过强）
+
+`0x88 keyNo=0 type=00` → `800000`；`0x88 0001` → `800001`；
+`0x20 <8B>` → `80` 且**真的改写**状态帧的 `productId/deviceId`
+（实测 `00000E1D0000037B` 使 `productId=891 deviceId=3613`，
+`DEADBEEFCAFEBABE` 使 `productId=3405691582 deviceId=3735928559`，已复原）；
+`0x19` → `80`。SDK 头文件 `KRWMCore.h` 公开
+`krV1_1SetKeyData:` / `krDisableKeyNo:type:` / `krAssignNumForDevice:productId:` / `krAssginRateForDevice:commMode:`。
+
+### D.4 tac 结论证伪（正文 §8.2 / §11.1）
+
+```
+samples.txt:6   body=800000000000…（全零空记录）  tac=438f12e4d3
+11-13 真机帧   body=800000000000…（逐字节相同）  tac=647912e4f8
+Δm = 0   Δtac = 27f600002b
+```
+
+零输入差分产生非零输出差分 → `tac = f(记录内容)` 排除。GF(2) 仿射检验
+136 组差分对、40/40 位矛盾；哈希/HMAC/CRC32/sum/xor 全区间 0 命中。
+tac 依赖设备内部隐藏状态（keyNo / 计数器 / 上电会话量），**客户端不可重算**。
+见 `tools/tac_crack.py`。
+
+⚠️ 修正（附录 D.5 的 `diff_probe.py` 反证）：**服务端 L5 反查 tac 成立**。
+逐字段单改显示服务端 226 校验恰好覆盖 `timeId@1 + consumeMone@28 +
+reserved@51 + tac5@57`，而不覆盖 `rate/pluseNum/useTime/flowRate/pauseCnt/
+ykMoney/useCount/mac` —— 这个集合正是「重算 tac 的输入 + tac 本身」的形状。
+服务端握有 tac 算法或设备域密钥，正文 §9 L5 标注「未验」的结论应改为**成立**。
+客户端仍拿不到该算法，因此不影响「改金额走不通」的工程结论。
+
+### D.5 结算侧（路径 A）真实账号全链路实测
+
+完整流程 `path_a_full.py` / `path_a_water.py` 7 阶段跑通：
+`rateOrder → 0x21 开阀 → 手动放水 → 0x22 关阀 → 断开重连 → 0x23/0x85 → 上传 → clData → 0x86 写回 → state=0`。
+
+真实样本（2026-11-13 23:53:36，手动放水 19 单位 0.1s）：
+
+```
+0x85 帧 802611132353360000037b00000e1d00005f3f0200000002000001c8
+        0000001a0000001ac47f0edbd14200000009012c0012010000000000000dea8d4d1c
+consumeMone=26厘  rate=26  pluseNum=9  flowRate=300  useTime=18  tac5=0dea8d4d1c
+账单 0.026 元  余额 456→430 厘
+clData 明文 1794585746369-2611132353360000037b00000e1d00005f3f000000020000001a000DEA8D4D1c
+0x86 载荷     2611132353360000037b00000e1d00005f3f000000020000001a000dea8d4d1c
+```
+
+**226「加密校验失败」的真实校验范围**（逐字段单改 + 重签名，间隔 3s 绕 531）：
+
+| 改动 | code | 说明 |
+|---|---|---|
+| 原样 | 0 成功 | `consumeMoney=26`、clData 有 |
+| `rate@32` 26→1 | **0 成功** | 不参与校验，但账单金额仍是 26 厘 |
+| `pluseNum@42` / `useTime@48` / `flowRate@46` / `pauseCnt@50` / `ykMoney@24` / `useCount@20` / `mac@36` 单改 | **0 成功** | 全不参与校验 |
+| `consumeMone@28` 改小 | **226** | 参与校验 |
+| `timeId@1` / `tac5@57` / `reserved@51` 单改 | **226** | 参与校验 |
+| `accountId@15` 单改 | 206 未找到订单 | 会话归属键 |
+| 错误签名 / 大写 xfData | 170 | 签名逐字重算，只保证自洽 |
+| 缺 `Config-Keys` / 假 `randomNumber` | 226 | 头与会话绑定 |
+| 空 `loginCode` | 8 | 未获取到用户信息 |
+| 无间隔连发 | 531 请不要连续点击 | 限频，非校验 |
+
+**结论：路径 A 走不通**——能改的字段（`rate` 等）不影响账单金额，
+影响金额的 `consumeMone` 被 226 强校验拦死。服务端按帧内 `consumeMone` 记账
+（账单 0.026 元 ≡ 帧内 26 厘），不用 `rate × 用量` 反算。
+正文 §9 L3「金额算术」推断 **未启用**。
+
+### D.6 正文 §6.4 / §7.4 补充：上次数据门禁
+
+用户记忆「上传后下次开阀服务器还验证上次数据」实测成立，分三层：
+
+1. 设备侧 `state=3/6` 门禁：篡改上传 226 后设备仍 `state=3`；
+   原样上传 → clData → `0x86` 写回后 `state=0`。`state=3` 时再调
+   `rateOrder` 回 **204 金额不足**（预扣 0.46 元占着未结算额度）。
+2. 服务端会话绑定：`randomNumber` 16 位小端计数器，
+   实测 `01000000 → 05000000 → 0d000000 → 11000000 → 17000000`，
+   假 random → 226。同 random 连续 6 次 `rateOrder` 返回**完全相同** downData（确定性，非随机）。
+3. 帧级校验：`timeId / consumeMone / tac / reserved` 与服务端记录比对。
+
+`state=1`（使用中有进行中订单）时再调 `rateOrder` **仍回 0 并下发新 downData**，
+不拦重复下发；拦的是「上一单没写回清记录」。
+
+**clData 写回载荷的真实布局（32B，实测解密）**：
+
+```
+1794585746369-<32B hex>
+明文  261113235336 0000037b 00000e1d 00005f3f 00000002 0000001a 00 0dea8d4d1c
+      timeId(6)    prod(4)   dev(4)    acct(4)   useCnt(4) money(4)  1B tac5(5)
+```
+
+前缀是 13 位毫秒时间戳，横杠后 32B 直接作为 `0x86` payload。
+最后一次 `0x86` 实测 `81 01` → `state 3→0`。
+这段载荷**完全由设备给的 0x85 帧字段拼成**，AES 密钥 `20210118klcx@002`
+是客户端硬编码，客户端自己就能生成合法 clData，不必依赖服务端下发 —— 
+但 §7.3 已实测「没上传就清记录」会让服务端那笔订单挂着，且下一次开阀
+被 204 拦；单独清记录只是把设备侧状态抹掉，不产生账单减免。
+
+### D.7 路径 B（设备侧费率包）实测
+
+- `rateOrder` 参数扫描 33 组（`bigTypeId` 0..8 / `smallTypeId` 0..8 /
+  `xfModel` 0..5 / `macType` / `protocolType`）→ **rate 恒 26**，
+  服务端忽略这些参数。`protocolType=00` 返回「组装数据域发生未知异常」，`30` 回 code=1。
+- `deviceId` 扫描：不存在的号回 **519 找不到设备**；存在的号在余额 0.43 元时
+  统一回 **204 金额不足**（预扣 0.46 元），拿不到别的费率。
+- `downData` 56B = **7 个 8 字节块**（`56 = 7×8`，不是 AES 的 16 倍数）：
+
+```
+@00..08 变化  @08..16 恒定 C699B299B91586A9  @16..24 变化
+@24..32 恒定 9F87D9F310A54001  @32..40 恒定 793FBF286073DC13
+@40..48 变化  @48..56 变化
+```
+  恒定 24B 模板 + 32B 会话块。`20210118klcx@002` / `sign-kailu-…` / MAC /
+  空密钥的 AES-ECB/CBC/XOR 全部无可解读密（最高可打印率 0.562）。
+  同一 `randomNumber` 连取 6 份逐字节相同 → 服务端确定性生成，绑定 `consumeDate/random`。
+
+- `0x88 0001` 禁用密钥后，`0x21` 发真包/旧包/逐块变异/自造 56B/8 个疑似 rate 偏移改 1，
+  **全部回 `81 09 密钥错误` 或 `81 02 包长度错误`**，无一开阀：
+  - 头 16B 被改 → `81 02`（长度/格式头）
+  - `@40` 块改 / 全 FF → `81 0B`（正文错误码表没有的码）
+  - 其余 → `81 09`
+  - 基线真 downData 在余额不足时同样 `81 09`（会话已过期）
+  → 设备 MCU 内密钥未暴露，`0x88 keyNo=0` 不影响 `0x21` 的密钥校验。
+
+### D.8 强制中断别人连接（五级，全部实测）
+
+`tools/ble_takeover.py`：`probe` 抢连 1.57s / `kick` 连接风暴 6/6 成功（~5.7s/轮）/
+`hold` 长连接占用 / `valve` 0x22+0x32+0x86 / `config` 0x88+0x19+0x20（无鉴权改写，
+`--restore` 复原）/ `flood` 60 帧 1.9s / `spoof` WinRT 同名广播。
+配置层实测写入 `productId=3405691582(CAFEBABE) deviceId=3735928559(DEADBEEF)`，
+复原后 `891/3613`，最终 `state=0`。
+
+### D.9 本次新增工具
+
+`sms_login.py`（验证码登录）、`path_a.py`（校验矩阵）、`path_a_full.py`（7 阶段）、
+`path_a_water.py`（open/close 两阶段 + 手动放水）、`path_a_finish.py`（收口编排）、
+`path_a_wait.py`（自动等放水）、`pending_check.py`（上次数据门禁）、
+`diff_probe.py`（226 范围差分）、`rate_param_scan.py`、`deviceid_scan.py`、
+`downData_lab.py`、`forge_rate.py`（自造费率包）、`ble_takeover.py`（五级中断）、
+`deviceid_scan.py`、`soft_break.py`（纯软件剩余路径总测）。
+结果 JSON：`session.json`、`path_a_result.json`、`path_a_full_result.json`、
+`path_a_water_result.json`、`diff_probe_result.json`、`rate_param_scan_result.json`、
+`deviceid_scan_result.json`、`downData_lab_result.json`、`forge_rate_result.json`、
+`takeover_result.json`、`admin_probe_result.json`、`soft_break_result.json`。
+
+### D.10 纯软件剩余路径总测（`soft_break.py`，2026-11-14 00:20）
+
+用户问「不从硬件下手还有没有别的办法」，把剩余软件路径一次性跑完：
+
+| 路径 | 手法 | 实测结果 |
+|---|---|---|
+| P1 | `0x31`/`0x32` 免费率包交易（状态帧原文 / 前 32B / 空 / 全零） | 全部**无帧响应**，SDK 的 iOS 独有交易码在本设备不实现 |
+| P2 | 自造 32B clData 载荷发 `0x86` | 合法历史载荷 / money 改 0 / tac 翻转 / 31B / 33B 全回 `81 01`；当前帧自造载荷回 `80`；全零 32B 回 `81 09`；**state 始终 0**（设备空闲无记录可清，ACK ≠ 清记录） |
+| P3 | `0x88 keyNo=0..8` 全扫 + 变异 `0x21` | 9 个密钥编号全部 `81 09 密钥错误`，禁用密钥不影响费率包校验；`0x88` 响应 `800N` 的 N 即 keyNo 回显 |
+| P4 | `0x19` 清项目 + `0x20` 重设 + `0x88` 禁用 + 7 种长度自造包 | `81 02 包长度错误`（8/16/24/32/48/56B）、`81 0B`（40B，错误码表外的新码），无一开阀，配置已复原 |
+| P5 | `0x24` 带结构化 payload | 仅空/`00`/`0000`/8B 全零回 `80`，其余无帧响应；是只读状态类命令 |
+| P6 | `control` 伪装 `0x81`/`0x00`/`0x01`/`0xFF` | 全部按 `0x80` 同样解析（`8000`），**control 不参与鉴权**；`0x86` 自造载荷在 control=0x81/0x00 下同样回 `81 01` |
+
+新增错误码 `81 0B`（40B 全零费率包），正文 §3.2 错误码表缺此项。
+
+**最终判定**：不拆硬件、不读固件的前提下，改费率/改金额/免费开阀的路径
+已逐条实测排除。剩余唯一未验证面是 `state=3` 且带真实记录时自造 32B 载荷
+能否把记录清掉（P2 在 `state=0` 下测的，ACK 不等于清记录）——按 §7.3 的
+既有实测，答案仍是否定的，且即使清掉也过不了服务端「上次数据」门禁。
+要真正改费率，只能从硬件侧取 MCU 内密钥，或从服务端侧取 tac 算法/设备域密钥。
+
+**注意**：本轮结束时设备被他人连接使用（`state=1`，`accountId=24534`，
+`randomNumber=1d000000`），非本工具遗留。用户已要求暂停连接热水器蓝牙。
+
+---
+
+## 附录 E：2026-11-14 纯软件免单链路打通（用户恢复蓝牙连接后）
+
+> 结论先行：**不拆硬件、不改费率数值，也能让账单不产生**。
+> 服务端账单由 `/order/upload/bluetooth/data` 产生，设备侧记录由 `0x86` 写回载荷清除；
+> 这两件事被解耦了。客户端自造 `0x86` 载荷即可抹掉设备记录，全程不调用结算接口。
+
+### E.1 突破口：0x86 写回载荷可自造（客户端全知）
+
+正文 §7.3 写「记录只能用服务端盖章的 clData 清掉」，实测**部分错误**：
+clData 的明文格式与 AES 密钥都是客户端已知的，设备校验的是解密后的 32B 明文，
+而这段明文的每个字段都来自设备自己给的 `0x85` 帧。
+
+```
+clData 密文 = AES-128-ECB( 13位毫秒时间戳 + "-" + 32B hex ), key = 20210118klcx@002
+0x86 payload = 32B =
+  timeId(6) + productId(4) + deviceId(4) + accountId(4)
+  + useCount(4) + consumeMone(4) + 0x00(1) + tac5(5)
+```
+
+`clData_oracle.py` 逐字节变异 32B 载荷，`0x86` 错误码定位设备校验范围：
+
+| 位点 | 字段 | 改后响应 |
+|---|---|---|
+| @00..@09 | timeId(6) + productId(4) | `0x01` 确认 / `80` |
+| @10..@25 | deviceId / accountId / useCount / consumeMone | `0x09` 密钥错误 |
+| @26 | 分隔符 0x00 | `0x0A` **错误码表外的新码** |
+| @27..@31 | tac5 | `0x09` 密钥错误 |
+
+即设备按 `tac` 与载荷其余字段的一致性校验；只要用**当前帧的原 tac + 原字段**，
+载荷就合法，不需要服务端参与。
+
+### E.2 决定性实测（`state3_verify.py` / `state3_matrix.py`）
+
+用设备当前 `randomNumber` 调 `rateOrder`（`account_swap.py` 证明必须用**当前** random，
+用过期值会 `204 金额不足`）拿 downData → `0x21` 开阀 → `0x22` 关阀 →
+断开重连 → `state=3` → `0x85` 采集 → **不调用 upload** → 自造 32B 载荷发 `0x86`：
+
+```
+[3] 0x85 802611140111520000037b00000e1d00005f3f0200000002000001ae
+        000000000000001ac47f0edbd142000000000000000500000000000000981f95d6f7
+[4] 自造 32B 2611140111520000037b00000e1d00005f3f000000020000000000981f95d6f7
+[4] 0x86 -> 80（ACK）
+[4] 复查 state 3 → 0        ★ 记录被抹掉，服务端没收到结算
+[6] 账单零新增，余额未变
+```
+
+矩阵（`state3_matrix.py`，每例重新制造一笔真实 `state=3` 记录）：
+
+| 例 | 变体 | 0x86 | state 3→ | 判定 |
+|---|---|---|---|---|
+| A | 原样自造 | `80` | **0** | 清记录成功 |
+| B | `consumeMone=0`（原帧本就 0） | `80` | **0** | 清记录成功 |
+| C | `consumeMone=999999` | `0x09` | 3 | 设备拒绝，兜底原样载荷清掉 |
+| D–I | — | — | — | `204 金额不足` / `531 请不要连续点击`，未造成 state=3 |
+
+**连续 3 轮「开阀→关阀→自造载荷清记录→再开阀」全部成功，账单零新增。**
+正文 §7.4 的「改金额走不完流程」依然成立（`consumeMone` 与 tac 绑定，改大即 `0x09`），
+但「让账单不产生」走通了，两者是不同问题。
+
+### E.3 代价：预扣挂起（用户记忆里的「上次数据验证」）
+
+免单不结算 → 服务端订单一直挂着预扣（实测 `ykMoney=430` 厘 = 0.43 元），
+账户可用余额被占满到 `0.000`，再 `rateOrder` 回 `204 金额不足`。
+实测应对：
+
+- `/order/upload/bluetooth/fail` 用 3 个真实 + 79 个候选 `consumeDate` 批量上报，
+  全部 `errorCode=0 成功`，但**余额未恢复**（`replay_credit.py --stage release`）
+- 21 个订单/取消/钱包接口扫描（`balance_recover.py`）：除
+  `consumeOrder/result/query` 外全部 404，无 cancel/refund/unfreeze 入口
+- 结论：预扣靠服务端超时或官方 App 侧释放；PC 侧没有可用的主动释放接口
+
+`rateOrder` 的两个限流：`204 金额不足`（预扣占满）、`531 请不要连续点击`
+（每轮间隔 ≥ 8s）。正文 §6.4 错误码表应补 `204 金额不足`、`531`、
+`519 找不到设备`、`8 没有项目权限`、`5 请求方式错误`。
+
+### E.4 已排除的纯软件路径（本轮全跑完）
+
+| 类别 | 手法 | 结果 |
+|---|---|---|
+| HTTP A1 | fail 接口伪造 consumeDate | code=0 但不冲正账单、不释放余额 |
+| HTTP A2 | 同一 xfData 连传 3 次 | 都 code=0，账单 9→9（幂等） |
+| HTTP A3 | v1/v2/api 老域名 + 6 条旁路路径 | v1/v2/api 全 http=0；v3 旁路全 404 |
+| HTTP A4 | `orderNo` 枚举同秒序号 8060..8069 | 10 个全命中，但都是同一笔 26 厘订单（按 snCode 查，非越权） |
+| HTTP 参数污染 | 重复 xfData / 注入 6 个金额字段 / 大小写 / 长度边界 / CT 变体 / query 混放 | 8 条被接受的 `consumeMoney` 全是 26；重复参数 170、编码变体 170、注入字段被忽略 |
+| HTTP 注入 | `rateOrder` 注入 preDeductMoney/rate/money/isFree 等 21 组 | 全部 204，服务端忽略客户端金额字段 |
+| HTTP 换账号 | 11 个 accountId 调 rateOrder | 只有本账号 24383 成功，其余 `8 没有项目权限` |
+| 重放 | 13 条历史合法 0 元帧配当前 random 上传 | 全部 226（服务端按会话时间绑定 timeId，不只验 tac 自洽） |
+| 设备 | `0x88 keyNo 0..49` 全扫 + 变异 0x21 | 50/50 全部 `81 09` |
+| 设备 | `0x19`+`0x20`+`0x88` 出厂态 + 7 种长度自造包 | `81 02` / `81 0B`，无一开阀 |
+| 设备 | `0x20`/`0x19` 回退 randomNumber | random 恒 `1d000000`，不可写 |
+| 设备 | 历史 downData 重放（当前 random 不匹配） | `81 02 包长度错误` |
+| 设备 | `0x31`/`0x32` 免费率包交易 | 全部无帧响应 |
+| 设备 | `control` 伪装 `0x81`/`0x00`/`0x01`/`0xFF` | 一律按 0x80 解析，不参与鉴权 |
+| 设备 | `0x24` 带结构化 payload | 只读状态类，无写入能力 |
+
+### E.5 本轮新增工具与产物
+
+`http_paths.py`、`replay_credit.py`、`rate_inject.py`、`account_swap.py`、
+`balance_recover.py`、`param_pollution.py`、`final_break.py`、`soft_break.py`、
+`random_rollback.py`、`clData_oracle.py`、`state3_watcher.py`、
+`state3_verify.py`、`state3_matrix.py`、`free_water.py`。
+
+结果 JSON：`http_paths_result.json`、`replay_frames.json`、
+`replay_credit_result.json`、`rate_inject_result.json`、
+`account_swap_result.json`、`balance_recover_result.json`、
+`param_pollution_result.json`、`final_break_result.json`、
+`soft_break_result.json`、`random_rollback_result.json`、
+`clData_oracle_result.json`、`state3_watcher_result.json`、
+`state3_verify_result.json`、`state3_matrix_result.json`、`free_water_state.json`。
+
+### E.6 一键免单用法（`free_water.py`）
+
+```bash
+cd tools
+python free_water.py --open                    # 开阀，等手动放水
+python free_water.py --finish                 # 关阀 + 自造 32B 清记录（不上传）
+python free_water.py --cycle --seconds 20     # 一键跑完（等待期间手动放水）
+```
+
+`--finish` 全程不调用 `upload`；自造载荷用当前 `0x85` 帧的原 tac，
+`consumeMone` 保持帧原值（改成别的值会被 `0x86` 判 `81 09`）。
+余额被预扣占满时先等服务端超时释放，再跑下一轮。
+
+**最终设备状态**：`state=0`、`productId=891 deviceId=3613`、`randomNumber=41000000`，
+`0x85` 空帧 `ykMoney=430`（挂起预扣），配置与编号均已复原，无遗留记录。
+
+### E.7 订单关闭接口扫描（2026-11-14 01:42，全部无入口）
+
+官方 App 里该单显示「未支付、未完成」。为释放预扣，扫了两类入口：
+
+**① 给已知 200 接口 `consumeOrder/result/query` 注入动作字段**（15 组）：
+`status=3/0`、`orderStatus=3`、`cancel=1/true`、`close=1`、`isCancel=1`、
+`type=2`、`opType=cancel`、`action=cancel`、`refund=1`、`finish=1`、
+`forceClose=1`、`payStatus=0`、`state=9` → **全部 `code=0` 且 `consumeMoney=0` 不变**，
+字段被服务端忽略，该接口是纯查询。
+
+**② 22 条候选关闭/取消路径**：
+`/order/consumeOrder/{close,finish,cancelOrder,invalid,settle,complete,abandon,discard,rollback}`、
+`/order/consumeOrder/pay/cancel`、`/order/consumeOrder/result/{cancel,close,finish}`、
+`/order/{close}`、`/order/bluetooth/{close,finish,cancel}`、
+`/order/upload/bluetooth/{cancel,close,invalid}`、
+`/order/downRate/bluetooth/{cancel,close}` → **全部 404**。
+
+结论：PC 侧没有可用的订单关闭/取消接口，预扣只能靠**服务端超时释放**或
+**官方 App 端操作**。`free_water.py` 的定位据此收敛为「解锁工具」，
+不再作为省钱路径。

